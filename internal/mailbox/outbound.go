@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/zachlatta/zrl-bot-email-control/internal/mimemsg"
+	"github.com/zachlatta/zrl-bot-email-control/internal/recipients"
 	"google.golang.org/api/gmail/v1"
 )
 
@@ -46,17 +47,21 @@ type SendResult struct {
 	LabelIDs []string `json:"label_ids,omitempty"`
 }
 
-func (s *Service) compose(ctx context.Context, service *gmail.Service, outgoing Outgoing) ([]byte, error) {
-	// Fail fast with a readable error; the authoritative check runs again on
-	// the composed bytes inside gate.go.
-	all := slices.Concat(outgoing.To, outgoing.Cc, outgoing.Bcc)
+// precheck fails fast, before Gmail is contacted, with a readable error. The
+// authoritative check runs again on the composed bytes inside gate.go.
+func (s *Service) precheck(addresses ...[]string) error {
+	all := slices.Concat(addresses...)
 	for _, address := range all {
 		parsed, err := mail.ParseAddress(address)
 		if err != nil || parsed.Name != "" || !strings.EqualFold(parsed.Address, address) {
-			return nil, fmt.Errorf("%q is not a single bare email address", address)
+			return fmt.Errorf("%w: %q is not a single bare email address", recipients.ErrRecipientNotAllowed, address)
 		}
 	}
-	if err := s.cfg.Allowlist.CheckAddresses(all); err != nil {
+	return s.cfg.Allowlist.CheckAddresses(all)
+}
+
+func (s *Service) compose(ctx context.Context, service *gmail.Service, outgoing Outgoing) ([]byte, error) {
+	if err := s.precheck(outgoing.To, outgoing.Cc, outgoing.Bcc); err != nil {
 		return nil, err
 	}
 	attachments, err := s.loadAttachments(ctx, service, outgoing.Attachments)
@@ -105,6 +110,9 @@ func (s *Service) loadAttachments(ctx context.Context, service *gmail.Service, i
 
 // Send composes and sends a new message.
 func (s *Service) Send(ctx context.Context, outgoing Outgoing) (SendResult, error) {
+	if err := s.precheck(outgoing.To, outgoing.Cc, outgoing.Bcc); err != nil {
+		return SendResult{}, err
+	}
 	service, err := s.gmail(ctx)
 	if err != nil {
 		return SendResult{}, err
@@ -221,11 +229,11 @@ type ForwardInput struct {
 
 // Forward forwards a message (with its attachments by default).
 func (s *Service) Forward(ctx context.Context, input ForwardInput) (SendResult, error) {
-	service, err := s.gmail(ctx)
-	if err != nil {
+	if err := s.precheck(input.To, input.Cc, input.Bcc); err != nil {
 		return SendResult{}, err
 	}
-	if err := s.cfg.Allowlist.CheckAddresses(slices.Concat(input.To, input.Cc, input.Bcc)); err != nil {
+	service, err := s.gmail(ctx)
+	if err != nil {
 		return SendResult{}, err
 	}
 	original, err := service.Users.Messages.Get("me", input.MessageID).Format("full").Context(ctx).Do()
@@ -316,6 +324,9 @@ func (s *Service) CreateReplyDraft(ctx context.Context, input ReplyInput) (Draft
 }
 
 func (s *Service) saveDraft(ctx context.Context, id string, outgoing Outgoing) (DraftSummary, error) {
+	if err := s.precheck(outgoing.To, outgoing.Cc, outgoing.Bcc); err != nil {
+		return DraftSummary{}, err
+	}
 	service, err := s.gmail(ctx)
 	if err != nil {
 		return DraftSummary{}, err

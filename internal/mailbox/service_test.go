@@ -436,3 +436,29 @@ func TestWrongMailboxIsRefused(t *testing.T) {
 		t.Fatalf("sent from the wrong mailbox: %v", err)
 	}
 }
+
+func TestAllowlistCheckedBeforeGmailIsContacted(t *testing.T) {
+	allow, _ := recipients.ParseAllowlist("zach@hackclub.com")
+	calls := 0
+	service := New(Config{Address: bot, Allowlist: allow, Gmail: func(context.Context) (*gmail.Service, error) {
+		calls++
+		return nil, ErrNotConnected
+	}})
+	ctx := t.Context()
+	stranger := Outgoing{To: []string{"zach@hackclub.com"}, Bcc: []string{"someone@example.com"}, Text: "x"}
+	if _, err := service.Send(ctx, stranger); !errors.Is(err, recipients.ErrRecipientNotAllowed) {
+		t.Errorf("Send = %v", err)
+	}
+	if _, err := service.CreateDraft(ctx, stranger); !errors.Is(err, recipients.ErrRecipientNotAllowed) {
+		t.Errorf("CreateDraft = %v", err)
+	}
+	if _, err := service.Forward(ctx, ForwardInput{MessageID: "m", To: []string{"someone@example.com"}}); !errors.Is(err, recipients.ErrRecipientNotAllowed) {
+		t.Errorf("Forward = %v", err)
+	}
+	if _, err := service.CreateFilter(ctx, FilterInput{Forward: "someone@example.com"}); !errors.Is(err, recipients.ErrRecipientNotAllowed) {
+		t.Errorf("CreateFilter = %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("Gmail was contacted %d times for blocked requests", calls)
+	}
+}
