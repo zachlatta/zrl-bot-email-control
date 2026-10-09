@@ -315,22 +315,30 @@ func (s *Service) fetchAttachment(ctx context.Context, service *gmail.Service, m
 	if err != nil {
 		return AttachmentInfo{}, nil, err
 	}
+	// Gmail issues a different attachment ID on every fetch, so the stable
+	// handle is the MIME part ID ("part:<id>"). A raw Gmail attachment ID from
+	// any earlier fetch is still accepted and passed straight through.
 	var part *gmail.MessagePart
 	walkParts(message.Payload, func(p *gmail.MessagePart) {
-		if part == nil && p.Body != nil && (p.Body.AttachmentId == attachmentID || "part:"+p.PartId == attachmentID) {
+		if part == nil && p.Body != nil && ("part:"+p.PartId == attachmentID || p.Body.AttachmentId == attachmentID) {
 			part = p
 		}
 	})
+	gmailID := ""
 	if part == nil {
-		return AttachmentInfo{}, nil, fmt.Errorf("attachment %s not found on message %s", attachmentID, messageID)
+		if strings.HasPrefix(attachmentID, "part:") {
+			return AttachmentInfo{}, nil, fmt.Errorf("attachment %s not found on message %s", attachmentID, messageID)
+		}
+		part = &gmail.MessagePart{Filename: "attachment", MimeType: "application/octet-stream", Body: &gmail.MessagePartBody{AttachmentId: attachmentID}}
 	}
+	gmailID = part.Body.AttachmentId
 	info := attachmentInfo(part)
 	if maxBytes > 0 && info.Size > maxBytes {
 		return AttachmentInfo{}, nil, fmt.Errorf("attachment %q is %d bytes, over max_bytes %d", info.Filename, info.Size, maxBytes)
 	}
 	encoded := part.Body.Data
-	if part.Body.AttachmentId != "" && strings.HasPrefix(attachmentID, "part:") == false {
-		body, err := service.Users.Messages.Attachments.Get("me", messageID, part.Body.AttachmentId).Context(ctx).Do()
+	if gmailID != "" {
+		body, err := service.Users.Messages.Attachments.Get("me", messageID, gmailID).Context(ctx).Do()
 		if err != nil {
 			return AttachmentInfo{}, nil, err
 		}
@@ -808,9 +816,9 @@ func isAttachment(part *gmail.MessagePart) bool {
 }
 
 func attachmentInfo(part *gmail.MessagePart) AttachmentInfo {
-	id := part.Body.AttachmentId
-	if id == "" {
-		id = "part:" + part.PartId
+	id := "part:" + part.PartId
+	if part.PartId == "" {
+		id = part.Body.AttachmentId
 	}
 	mimeType := part.MimeType
 	if mimeType == "" {

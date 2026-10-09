@@ -462,3 +462,26 @@ func TestAllowlistCheckedBeforeGmailIsContacted(t *testing.T) {
 		t.Errorf("Gmail was contacted %d times for blocked requests", calls)
 	}
 }
+
+func TestAttachmentIDsAreStableAcrossFetches(t *testing.T) {
+	service, fake := newService(t)
+	id := fake.AddMessage(inboundFromZach, "INBOX")
+	first, _ := service.GetMessage(t.Context(), id, GetOptions{})
+	second, _ := service.GetMessage(t.Context(), id, GetOptions{})
+	if first.Attachments[0].AttachmentID != second.Attachments[0].AttachmentID {
+		t.Fatalf("attachment IDs differ across fetches: %q vs %q", first.Attachments[0].AttachmentID, second.Attachments[0].AttachmentID)
+	}
+	// A raw Gmail ID from an earlier fetch still downloads.
+	message := fake.Service(t)
+	raw, _ := message.Users.Messages.Get("me", id).Do()
+	var gmailID string
+	walkParts(raw.Payload, func(p *gmail.MessagePart) {
+		if p.Filename != "" {
+			gmailID = p.Body.AttachmentId
+		}
+	})
+	data, err := service.GetAttachment(t.Context(), id, gmailID, 0)
+	if err != nil || data.Size != int64(len("%PDF-1.4 fake")) {
+		t.Fatalf("raw-ID download = %#v, %v", data, err)
+	}
+}

@@ -46,6 +46,7 @@ type Server struct {
 	filters  map[string]*gmail.Filter
 	sent     [][]byte
 	requests []string
+	renders  int
 }
 
 // New starts a fake for address and registers cleanup on t.
@@ -539,7 +540,8 @@ func (s *Server) render(message *Message, format string) *gmail.Message {
 		return out
 	}
 	body, _ := io.ReadAll(parsed.Body)
-	counter := 0
+	s.renders++
+	counter := s.renders
 	out.Payload = buildPart(message.ID, "", map[string][]string(parsed.Header), body, &counter)
 	if format == "metadata" {
 		stripBodies(out.Payload)
@@ -618,7 +620,9 @@ func buildPart(messageID, partID string, header map[string][]string, body []byte
 	}
 	part.Filename = filename
 	if filename != "" {
-		part.Body = &gmail.MessagePartBody{AttachmentId: "att-" + messageID + "-" + partIDOrRoot(partID), Size: int64(len(decoded))}
+		// Real Gmail returns a different attachment ID on every fetch; only
+		// the prefix is stable here.
+		part.Body = &gmail.MessagePartBody{AttachmentId: fmt.Sprintf("att-%s-%s-%d", messageID, partIDOrRoot(partID), *counter), Size: int64(len(decoded))}
 		return part
 	}
 	part.Body = &gmail.MessagePartBody{Size: int64(len(decoded)), Data: base64.URLEncoding.EncodeToString(decoded)}
@@ -662,7 +666,7 @@ func findAttachment(messageID, partID string, header map[string][]string, body [
 			index++
 		}
 	}
-	if "att-"+messageID+"-"+partIDOrRoot(partID) == want {
+	if strings.HasPrefix(want, "att-"+messageID+"-"+partIDOrRoot(partID)+"-") {
 		return decodeTransfer(firstValue(header, "Content-Transfer-Encoding"), body), true
 	}
 	return nil, false
