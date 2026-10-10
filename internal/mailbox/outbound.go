@@ -9,6 +9,8 @@ import (
 	"net/mail"
 	"slices"
 	"strings"
+	"time"
+	_ "time/tzdata"
 
 	"github.com/zachlatta/zrl-bot-email-control/internal/mimemsg"
 	"github.com/zachlatta/zrl-bot-email-control/internal/recipients"
@@ -202,15 +204,17 @@ func (s *Service) replyOutgoing(ctx context.Context, service *gmail.Service, inp
 	outgoing.references = strings.TrimSpace(strings.Join(strings.Fields(headers["references"]+" "+messageID), " "))
 	if !input.OmitQuote {
 		body := detail(original, GetOptions{IncludeHTML: true})
-		attribution := fmt.Sprintf("On %s, %s wrote:", headers["date"], decodeHeader(headers["from"]))
+		attribution := replyAttribution(headers["date"], decodeHeader(headers["from"]))
 		outgoing.Text = strings.TrimRight(input.Text, "\n") + "\n\n" + attribution + "\n" + quoteText(body.Text)
-		if input.HTML != "" {
-			quoted := body.HTML
-			if quoted == "" {
-				quoted = "<pre>" + html.EscapeString(body.Text) + "</pre>"
-			}
-			outgoing.HTML = input.HTML + `<br><div class="gmail_quote"><div>` + html.EscapeString(attribution) + `</div><blockquote style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">` + quoted + `</blockquote></div>`
+		note := input.HTML
+		if note == "" {
+			note = textToHTML(input.Text)
 		}
+		quoted := htmlBodyContent(body.HTML)
+		if quoted == "" {
+			quoted = textToHTML(body.Text)
+		}
+		outgoing.HTML = note + `<br><div class="gmail_quote"><div dir="ltr" class="gmail_attr">` + html.EscapeString(attribution) + `<br></div><blockquote class="gmail_quote" style="margin:0px 0px 0px 0.8ex;border-left:1px solid rgb(204,204,204);padding-left:1ex">` + quoted + `</blockquote></div>`
 	}
 	return outgoing, nil
 }
@@ -459,6 +463,62 @@ func dedupe(values, exclude []string) []string {
 
 func (s *Service) withoutSelf(values []string) []string {
 	return slices.DeleteFunc(values, func(v string) bool { return strings.EqualFold(v, s.cfg.Address) })
+}
+
+// replyLocation is the zone reply attributions are written in (Zach's).
+var replyLocation = func() *time.Location {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		return time.UTC
+	}
+	return location
+}()
+
+// replyAttribution formats the "On ..., X wrote:" line the way Gmail does,
+// in Eastern time, falling back to the raw Date header if it does not parse.
+func replyAttribution(dateHeader, from string) string {
+	when := strings.TrimSpace(dateHeader)
+	if parsed, err := mail.ParseDate(when); err == nil {
+		when = parsed.In(replyLocation).Format("Mon, Jan 2, 2006 at 3:04 PM")
+	}
+	return fmt.Sprintf("On %s %s wrote:", when, from)
+}
+
+// textToHTML renders a plain-text body as simple HTML: blank lines separate
+// paragraphs, single newlines become <br>.
+func textToHTML(text string) string {
+	text = strings.TrimSpace(strings.ReplaceAll(text, "\r\n", "\n"))
+	if text == "" {
+		return ""
+	}
+	var out strings.Builder
+	for _, paragraph := range strings.Split(text, "\n\n") {
+		paragraph = strings.Trim(paragraph, "\n")
+		if paragraph == "" {
+			continue
+		}
+		out.WriteString("<div>" + strings.ReplaceAll(html.EscapeString(paragraph), "\n", "<br>") + "</div><div><br></div>")
+	}
+	return strings.TrimSuffix(out.String(), "<div><br></div>")
+}
+
+// htmlBodyContent returns what is inside <body>, so a quoted message does not
+// nest a whole <html> document inside the reply.
+func htmlBodyContent(document string) string {
+	lower := strings.ToLower(document)
+	start := strings.Index(lower, "<body")
+	if start < 0 {
+		return strings.TrimSpace(document)
+	}
+	open := strings.Index(lower[start:], ">")
+	if open < 0 {
+		return strings.TrimSpace(document)
+	}
+	content := document[start+open+1:]
+	if end := strings.LastIndex(strings.ToLower(content), "</body>"); end >= 0 {
+		content = content[:end]
+	}
+	return strings.TrimSpace(content)
 }
 
 func quoteText(text string) string {

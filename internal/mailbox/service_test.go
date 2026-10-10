@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"io"
+	"mime/quotedprintable"
 	"slices"
 	"strings"
 	"testing"
@@ -161,6 +163,32 @@ func TestReplyToAllowedSender(t *testing.T) {
 	}
 	if strings.Contains(raw, "Cc:") {
 		t.Errorf("plain reply should not cc anyone:\n%s", raw)
+	}
+}
+
+func TestReplyQuotesOriginalInHTML(t *testing.T) {
+	service, fake := newService(t)
+	id := fake.AddMessage(inboundFromZach, "INBOX")
+	if _, err := service.Reply(t.Context(), ReplyInput{MessageID: id, Text: "Done.\n\nSecond <line>."}); err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+	decoded, err := io.ReadAll(quotedprintable.NewReader(strings.NewReader(string(fake.Sent()[0]))))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	raw := string(decoded)
+	for _, want := range []string{
+		"text/html",
+		"<div>Done.</div><div><br></div><div>Second &lt;line&gt;.</div>",
+		`<div class="gmail_quote">`,
+		`<blockquote class="gmail_quote"`,
+		"<div>Here are the numbers.</div></blockquote>",
+		"On Thu, Oct 8, 2026 at 10:00 AM Zach Latta &lt;zach@hackclub.com&gt; wrote:",
+		"On Thu, Oct 8, 2026 at 10:00 AM Zach Latta <zach@hackclub.com> wrote:\r\n> Here are the numbers.",
+	} {
+		if !strings.Contains(raw, want) {
+			t.Errorf("reply missing %q:\n%s", want, raw)
+		}
 	}
 }
 
