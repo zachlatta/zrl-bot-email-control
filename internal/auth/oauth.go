@@ -27,12 +27,43 @@ const mailScope = "email"
 // authorize again.
 const defaultRefreshTTL = 10 * 365 * 24 * time.Hour
 
+// Registration is unauthenticated (RFC 7591), so its size and count are
+// bounded to keep anyone on the internet from growing the state file without
+// limit. Evicting an old client only stops it from starting a new
+// authorization; refresh tokens it already holds keep working.
+const (
+	// MaxClients is how many registered clients are kept; registering one
+	// more evicts the oldest.
+	MaxClients           = 200
+	maxRedirectURIs      = 10
+	maxRedirectURILength = 2048
+	maxClientNameLength  = 200
+)
+
+// defaultFailureDelay slows down guesses of the shared secret.
+const defaultFailureDelay = 500 * time.Millisecond
+
 // Client is a registered OAuth client. Client IDs are public identifiers, so
 // they are stored verbatim.
 type Client struct {
 	ID           string
 	Name         string
 	RedirectURIs []string
+	CreatedAt    time.Time
+}
+
+// EvictOldestClients deletes the oldest clients until at most MaxClients
+// remain. Stores call it after saving a client.
+func EvictOldestClients(clients map[string]Client) {
+	for len(clients) > MaxClients {
+		oldest := ""
+		for id, client := range clients {
+			if oldest == "" || client.CreatedAt.Before(clients[oldest].CreatedAt) {
+				oldest = id
+			}
+		}
+		delete(clients, oldest)
+	}
 }
 
 // Code is a stored authorization code. It is keyed by a hash of the code value
@@ -76,7 +107,10 @@ type Config struct {
 	CodeTTL    time.Duration
 	TokenTTL   time.Duration
 	RefreshTTL time.Duration
-	Now        func() time.Time
+	// FailureDelay is how long a wrong secret is held before the response.
+	// Zero means the default (500ms); negative disables it (tests).
+	FailureDelay time.Duration
+	Now          func() time.Time
 	// Store persists clients, codes, and tokens. When nil, an in-memory store
 	// is used (non-durable; intended for tests and single-process use).
 	Store Store
@@ -90,6 +124,7 @@ type Server struct {
 	codeTTL    time.Duration
 	tokenTTL   time.Duration
 	refreshTTL time.Duration
+	failDelay  time.Duration
 	now        func() time.Time
 	store      Store
 }
@@ -108,6 +143,9 @@ func NewServer(config Config) *Server {
 	if config.Now == nil {
 		config.Now = time.Now
 	}
+	if config.FailureDelay == 0 {
+		config.FailureDelay = defaultFailureDelay
+	}
 	if config.Store == nil {
 		config.Store = newMemoryStore()
 	}
@@ -117,6 +155,7 @@ func NewServer(config Config) *Server {
 		codeTTL:    config.CodeTTL,
 		tokenTTL:   config.TokenTTL,
 		refreshTTL: config.RefreshTTL,
+		failDelay:  max(config.FailureDelay, 0),
 		now:        config.Now,
 		store:      config.Store,
 		hasSecret:  config.Secret != "",
@@ -209,8 +248,12 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "redirect_uris and public client authentication are required")
 		return
 	}
+	if len(request.RedirectURIs) > maxRedirectURIs || len(request.ClientName) > maxClientNameLength {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", fmt.Sprintf("at most %d redirect URIs and a client name of at most %d bytes", maxRedirectURIs, maxClientNameLength))
+		return
+	}
 	for _, redirectURI := range request.RedirectURIs {
-		if !validRedirectURI(redirectURI) {
+		if len(redirectURI) > maxRedirectURILength || !validRedirectURI(redirectURI) {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_redirect_uri", "redirect URI must use HTTPS or an HTTP loopback address")
 			return
 		}
@@ -226,7 +269,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "the code response type is required")
 		return
 	}
-	registered := Client{ID: randomText(), Name: request.ClientName, RedirectURIs: slices.Clone(request.RedirectURIs)}
+	registered := Client{ID: randomText(), Name: request.ClientName, RedirectURIs: slices.Clone(request.RedirectURIs), CreatedAt: s.now()}
 	if err := s.store.SaveClient(r.Context(), registered); err != nil {
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not persist client registration")
 		return
@@ -242,6 +285,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 }
 
 type authorizationRequest struct {
+	ClientName  string
 	ClientID    string
 	RedirectURI string
 	Challenge   string
@@ -255,14 +299,36 @@ type authorizationPageData struct {
 	Error string
 }
 
+// RedirectHost is where the authorization code will be sent, shown so a
+// phishing client registered by someone else stands out.
+func (d authorizationPageData) RedirectHost() string {
+	parsed, err := url.Parse(d.RedirectURI)
+	if err != nil {
+		return d.RedirectURI
+	}
+	return parsed.Host
+}
+
+// pageHeaders keep the authorize page from being framed (clickjacking a
+// password-manager autofill) and from leaking its query through Referer.
+// There is no form-action directive: browsers apply it to the redirect back
+// to the client, which is on another origin.
+func pageHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'")
+}
+
 func (s *Server) authorizePage(w http.ResponseWriter, r *http.Request) {
 	request, err := s.parseAuthorizationRequest(r.Context(), r.URL.Query())
 	if err != nil {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
+	pageHeaders(w)
 	if err := authorizationPage.Execute(w, authorizationPageData{authorizationRequest: request}); err != nil {
 		http.Error(w, "render authorization page", http.StatusInternalServerError)
 	}
@@ -279,8 +345,8 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.CheckSecret(r.PostForm.Get("secret")) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
+		time.Sleep(s.failDelay)
+		pageHeaders(w)
 		w.WriteHeader(http.StatusUnauthorized)
 		_ = authorizationPage.Execute(w, authorizationPageData{authorizationRequest: request, Error: "That secret code is not valid."})
 		return
@@ -336,6 +402,7 @@ func (s *Server) parseAuthorizationRequest(ctx context.Context, values url.Value
 	if !ok || !slices.Contains(registered.RedirectURIs, request.RedirectURI) {
 		return authorizationRequest{}, errors.New("unknown client or redirect URI")
 	}
+	request.ClientName = registered.Name
 	if request.Scope == "" {
 		request.Scope = mailScope
 	}
@@ -509,6 +576,7 @@ func (m *memoryStore) SaveClient(_ context.Context, client Client) error {
 	defer m.mu.Unlock()
 	client.RedirectURIs = slices.Clone(client.RedirectURIs)
 	m.clients[client.ID] = client
+	EvictOldestClients(m.clients)
 	return nil
 }
 
@@ -571,7 +639,8 @@ var authorizationPage = template.Must(template.New("authorize").Parse(`<!doctype
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize zrl-bot email</title>
 <style>body{font-family:system-ui,sans-serif;max-width:32rem;margin:10vh auto;padding:1.5rem;color:#17202a}form{display:grid;gap:1rem}input,button{font:inherit;padding:.75rem}button{cursor:pointer;background:#17202a;color:white;border:0;border-radius:.35rem}.error{color:#a00}</style></head>
-<body><h1>Authorize zrl-bot email</h1><p>Enter the private secret code to give <strong>{{.ClientID}}</strong> full control of the bot mailbox. Outgoing mail is still limited to the server allowlist.</p>
+<body><h1>Authorize zrl-bot email</h1><p>Enter the private secret code to give <strong>{{with .ClientName}}{{.}}{{else}}an unnamed client{{end}}</strong> full control of the bot mailbox. Outgoing mail is still limited to the server allowlist.</p>
+<p>After you approve, access is sent to <strong>{{.RedirectHost}}</strong>. Stop here if you did not just connect a client there.</p>
 {{with .Error}}<p class="error">{{.}}</p>{{end}}
 <form method="post" action="/oauth/authorize">
 <input type="hidden" name="client_id" value="{{.ClientID}}"><input type="hidden" name="redirect_uri" value="{{.RedirectURI}}">

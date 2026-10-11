@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -509,5 +510,107 @@ func TestBearerMiddlewareAdvertisesProtectedResource(t *testing.T) {
 	want := `resource_metadata="https://mail.example.com/.well-known/oauth-protected-resource"`
 	if !strings.Contains(response.Header().Get("WWW-Authenticate"), want) {
 		t.Fatalf("WWW-Authenticate = %q, want it to contain %q", response.Header().Get("WWW-Authenticate"), want)
+	}
+}
+
+func authorizeQuery(clientID, redirectURI string) url.Values {
+	return url.Values{
+		"client_id":             {clientID},
+		"redirect_uri":          {redirectURI},
+		"response_type":         {"code"},
+		"code_challenge":        {"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		"code_challenge_method": {"S256"},
+	}
+}
+
+func TestAuthorizePageCannotBeFramed(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{Issuer: "https://mail.example.com", Secret: "right", FailureDelay: -1})
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	clientID := registerClient(t, mux, "https://client.example.com/callback")
+	query := authorizeQuery(clientID, "https://client.example.com/callback")
+
+	page := httptest.NewRecorder()
+	mux.ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+query.Encode(), nil))
+	query.Set("secret", "wrong")
+	failed := postForm(t, mux, "/oauth/authorize", query)
+	for name, response := range map[string]*httptest.ResponseRecorder{"page": page, "wrong secret": failed} {
+		if got := response.Header().Get("X-Frame-Options"); got != "DENY" {
+			t.Errorf("%s: X-Frame-Options = %q, want DENY", name, got)
+		}
+		if csp := response.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "frame-ancestors 'none'") {
+			t.Errorf("%s: Content-Security-Policy = %q, want frame-ancestors 'none'", name, csp)
+		}
+		if got := response.Header().Get("Referrer-Policy"); got != "no-referrer" {
+			t.Errorf("%s: Referrer-Policy = %q, want no-referrer", name, got)
+		}
+	}
+}
+
+func TestAuthorizePageNamesClientAndDestination(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{Issuer: "https://mail.example.com", Secret: "right"})
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	clientID := registerClient(t, mux, "https://client.example.com/callback")
+	page := httptest.NewRecorder()
+	mux.ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+authorizeQuery(clientID, "https://client.example.com/callback").Encode(), nil))
+	body := page.Body.String()
+	for _, want := range []string{"test client", "client.example.com"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("authorize page does not show %q; body: %s", want, body)
+		}
+	}
+}
+
+func TestRegisterBoundsClientMetadata(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{Issuer: "https://mail.example.com", Secret: "right"})
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	manyURIs := make([]string, maxRedirectURIs+1)
+	for i := range manyURIs {
+		manyURIs[i] = fmt.Sprintf("https://client.example.com/cb%d", i)
+	}
+	for name, document := range map[string]map[string]any{
+		"too many redirect URIs": {"client_name": "x", "redirect_uris": manyURIs},
+		"long client name":       {"client_name": strings.Repeat("n", maxClientNameLength+1), "redirect_uris": []string{"https://client.example.com/cb"}},
+		"long redirect URI":      {"client_name": "x", "redirect_uris": []string{"https://client.example.com/" + strings.Repeat("p", maxRedirectURILength)}},
+	} {
+		body, _ := json.Marshal(document)
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/oauth/register", strings.NewReader(string(body))))
+		if response.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", name, response.Code)
+		}
+	}
+}
+
+func TestClientRegistrationsAreCapped(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{Issuer: "https://mail.example.com", Secret: "right"})
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	first := registerClient(t, mux, "http://127.0.0.1/callback")
+	tokens := exchangeAuthorizationCode(t, mux, first, "right")
+	for range MaxClients {
+		registerClient(t, mux, "http://127.0.0.1/callback")
+	}
+	if _, ok, _ := server.store.Client(t.Context(), first); ok {
+		t.Fatal("oldest client survived past the registration cap")
+	}
+	last := registerClient(t, mux, "http://127.0.0.1/callback")
+	if _, ok, _ := server.store.Client(t.Context(), last); !ok {
+		t.Fatal("newest client was evicted")
+	}
+	// An evicted client keeps working through its refresh token.
+	refreshed := postForm(t, mux, "/oauth/token", url.Values{"grant_type": {"refresh_token"}, "refresh_token": {tokens["refresh_token"].(string)}, "client_id": {first}})
+	if refreshed.Code != http.StatusOK {
+		t.Fatalf("refresh after eviction: status %d; body %s", refreshed.Code, refreshed.Body.String())
 	}
 }

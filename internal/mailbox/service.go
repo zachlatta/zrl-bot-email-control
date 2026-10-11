@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/zachlatta/zrl-bot-email-control/internal/recipients"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/text/encoding/htmlindex"
 	"google.golang.org/api/gmail/v1"
 )
@@ -24,6 +25,9 @@ const (
 	defaultMaxAttachmentBytes = 20 << 20
 	defaultSearchResults      = 25
 	maxSearchResults          = 100
+	// fetchConcurrency bounds parallel Gmail reads when a listing has to
+	// fetch every message, well under Gmail's per-user rate limit.
+	fetchConcurrency = 10
 )
 
 // ErrNotConnected means the mailbox has not completed Google authorization.
@@ -132,15 +136,31 @@ func (s *Service) Search(ctx context.Context, input SearchInput) (SearchResult, 
 	if err != nil {
 		return SearchResult{}, err
 	}
-	result := SearchResult{NextPageToken: response.NextPageToken, ResultSizeEstimate: response.ResultSizeEstimate, Messages: []MessageSummary{}}
-	for _, item := range response.Messages {
-		message, err := service.Users.Messages.Get("me", item.Id).Format("full").Context(ctx).Do()
+	result := SearchResult{NextPageToken: response.NextPageToken, ResultSizeEstimate: response.ResultSizeEstimate, Messages: make([]MessageSummary, len(response.Messages))}
+	err = forEachConcurrently(ctx, len(response.Messages), func(ctx context.Context, i int) error {
+		id := response.Messages[i].Id
+		message, err := service.Users.Messages.Get("me", id).Format("full").Context(ctx).Do()
 		if err != nil {
-			return SearchResult{}, fmt.Errorf("get message %s: %w", item.Id, err)
+			return fmt.Errorf("get message %s: %w", id, err)
 		}
-		result.Messages = append(result.Messages, summarize(message))
+		result.Messages[i] = summarize(message)
+		return nil
+	})
+	if err != nil {
+		return SearchResult{}, err
 	}
 	return result, nil
+}
+
+// forEachConcurrently calls fetch for 0..n-1 with bounded parallelism and
+// returns the first error. Callers write results by index, so order is kept.
+func forEachConcurrently(ctx context.Context, n int, fetch func(context.Context, int) error) error {
+	group, ctx := errgroup.WithContext(ctx)
+	group.SetLimit(fetchConcurrency)
+	for i := range n {
+		group.Go(func() error { return fetch(ctx, i) })
+	}
+	return group.Wait()
 }
 
 // ThreadSummary is a compact thread listing.
@@ -180,16 +200,17 @@ func (s *Service) SearchThreads(ctx context.Context, input SearchInput) (SearchT
 	if err != nil {
 		return SearchThreadsResult{}, err
 	}
-	result := SearchThreadsResult{NextPageToken: response.NextPageToken, ResultSizeEstimate: response.ResultSizeEstimate, Threads: []ThreadSummary{}}
-	for _, item := range response.Threads {
-		thread, err := service.Users.Threads.Get("me", item.Id).Format("metadata").MetadataHeaders("From", "To", "Cc", "Subject", "Date").Context(ctx).Do()
+	result := SearchThreadsResult{NextPageToken: response.NextPageToken, ResultSizeEstimate: response.ResultSizeEstimate, Threads: make([]ThreadSummary, len(response.Threads))}
+	err = forEachConcurrently(ctx, len(response.Threads), func(ctx context.Context, i int) error {
+		id := response.Threads[i].Id
+		thread, err := service.Users.Threads.Get("me", id).Format("metadata").MetadataHeaders("From", "To", "Cc", "Subject", "Date").Context(ctx).Do()
 		if err != nil {
-			return SearchThreadsResult{}, fmt.Errorf("get thread %s: %w", item.Id, err)
+			return fmt.Errorf("get thread %s: %w", id, err)
 		}
 		summary := ThreadSummary{ID: thread.Id, MessageCount: len(thread.Messages), Participants: []string{}, LabelIDs: []string{}}
-		for i, message := range thread.Messages {
+		for j, message := range thread.Messages {
 			headers := headerMap(message.Payload)
-			if i == 0 {
+			if j == 0 {
 				summary.Subject = decodeHeader(headers["subject"])
 			}
 			summary.Snippet = html.UnescapeString(message.Snippet)
@@ -204,7 +225,11 @@ func (s *Service) SearchThreads(ctx context.Context, input SearchInput) (SearchT
 				}
 			}
 		}
-		result.Threads = append(result.Threads, summary)
+		result.Threads[i] = summary
+		return nil
+	})
+	if err != nil {
+		return SearchThreadsResult{}, err
 	}
 	return result, nil
 }
@@ -242,6 +267,7 @@ type MessageDetail struct {
 	Text            string           `json:"text"`
 	HTML            string           `json:"html,omitempty"`
 	Truncated       bool             `json:"truncated,omitempty"`
+	QuotedTrimmed   bool             `json:"quoted_trimmed,omitempty" jsonschema:"Quoted earlier messages were cut from the end of text; pass include_quoted to keep them."`
 	Attachments     []AttachmentInfo `json:"attachments"`
 	Headers         []Header         `json:"headers,omitempty"`
 }
@@ -258,13 +284,19 @@ func (s *Service) GetMessage(ctx context.Context, id string, options GetOptions)
 	return detail(message, options), nil
 }
 
+// ThreadOptions controls get_thread output.
+type ThreadOptions struct {
+	GetOptions
+	IncludeQuoted bool `json:"include_quoted,omitempty" jsonschema:"Keep the quoted earlier messages ('> ...' lines and the 'On ... wrote:' line) at the end of each reply's text. By default they are cut, because the thread already contains those messages. The first message is never cut."`
+}
+
 // ThreadDetail is every message of a thread, oldest first.
 type ThreadDetail struct {
 	ID       string          `json:"id"`
 	Messages []MessageDetail `json:"messages"`
 }
 
-func (s *Service) GetThread(ctx context.Context, id string, options GetOptions) (ThreadDetail, error) {
+func (s *Service) GetThread(ctx context.Context, id string, options ThreadOptions) (ThreadDetail, error) {
 	service, err := s.gmail(ctx)
 	if err != nil {
 		return ThreadDetail{}, err
@@ -274,35 +306,109 @@ func (s *Service) GetThread(ctx context.Context, id string, options GetOptions) 
 		return ThreadDetail{}, err
 	}
 	out := ThreadDetail{ID: thread.Id, Messages: []MessageDetail{}}
-	for _, message := range thread.Messages {
-		out.Messages = append(out.Messages, detail(message, options))
+	for i, message := range thread.Messages {
+		message := detail(message, options.GetOptions)
+		// The first message may quote mail that is not in this thread (Zach
+		// copying the bot into an existing conversation), so it is kept whole.
+		if i > 0 && !options.IncludeQuoted {
+			message.Text, message.QuotedTrimmed = trimQuoted(message.Text)
+		}
+		out.Messages = append(out.Messages, message)
 	}
 	return out, nil
+}
+
+// attributionLine matches the "On <date> <someone> wrote:" line that
+// introduces a quote, which mail clients often wrap onto two lines.
+var attributionLine = regexp.MustCompile(`(?is)^on\s.{1,300}\swrote:$`)
+
+// trimQuoted removes a bottom-posted quote: the trailing run of "> " lines
+// and the attribution line just above it. Inline replies (new text between
+// quoted lines) and messages that are entirely quoted are left unchanged.
+func trimQuoted(text string) (string, bool) {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	end := len(lines)
+	for end > 0 && strings.TrimSpace(lines[end-1]) == "" {
+		end--
+	}
+	start := end
+	for start > 0 && (strings.HasPrefix(lines[start-1], ">") || strings.TrimSpace(lines[start-1]) == "") {
+		start--
+	}
+	if start == end || !slices.ContainsFunc(lines[start:end], func(line string) bool { return strings.HasPrefix(line, ">") }) {
+		return text, false
+	}
+	// Drop the attribution, which may span up to two lines.
+	for span := 1; span <= 2 && start-span >= 0; span++ {
+		if attributionLine.MatchString(strings.TrimSpace(strings.Join(lines[start-span:start], " "))) {
+			start -= span
+			break
+		}
+	}
+	kept := strings.TrimRight(strings.Join(lines[:start], "\n"), " \t\n")
+	if strings.TrimSpace(kept) == "" {
+		return text, false
+	}
+	return kept, true
 }
 
 // AttachmentData is attachment content.
 type AttachmentData struct {
 	Filename   string `json:"filename"`
 	MimeType   string `json:"mime_type"`
-	Size       int64  `json:"size"`
-	DataBase64 string `json:"data_base64" jsonschema:"Standard base64 of the file bytes."`
-	Text       string `json:"text,omitempty" jsonschema:"Decoded text for text/* attachments."`
+	Size       int64  `json:"size" jsonschema:"Size of the whole attachment in bytes."`
+	Offset     int64  `json:"offset" jsonschema:"Byte offset of data_base64 within the attachment."`
+	Length     int64  `json:"length" jsonschema:"Number of bytes in data_base64."`
+	NextOffset int64  `json:"next_offset,omitempty" jsonschema:"Set when more bytes remain: call again with this offset."`
+	DataBase64 string `json:"data_base64" jsonschema:"Standard base64 of the bytes from offset to offset+length."`
+	Text       string `json:"text,omitempty" jsonschema:"Decoded text for text/* attachments (whole file only)."`
 }
 
-func (s *Service) GetAttachment(ctx context.Context, messageID, attachmentID string, maxBytes int64) (AttachmentData, error) {
+// Complete reports whether the data is the whole attachment.
+func (a AttachmentData) Complete() bool { return a.Offset == 0 && a.Length == a.Size }
+
+// AttachmentRequest selects an attachment, or a byte range of one.
+type AttachmentRequest struct {
+	MessageID    string `json:"message_id"`
+	AttachmentID string `json:"attachment_id" jsonschema:"attachment_id from get_message."`
+	Offset       int64  `json:"offset,omitempty" jsonschema:"First byte to return (default 0). Use with length to download a large file in pieces."`
+	Length       int64  `json:"length,omitempty" jsonschema:"Bytes to return from offset (default: to the end). Through a proxy such as PDW, use 5242880 (5 MiB) pieces for files over about 10 MiB, then join them."`
+	MaxBytes     int64  `json:"max_bytes,omitempty" jsonschema:"Refuse to return more than this many bytes in one call (default 20 MiB)."`
+}
+
+func (s *Service) GetAttachment(ctx context.Context, request AttachmentRequest) (AttachmentData, error) {
+	maxBytes := request.MaxBytes
 	if maxBytes <= 0 {
 		maxBytes = defaultMaxAttachmentBytes
+	}
+	if request.Offset < 0 || request.Length < 0 {
+		return AttachmentData{}, errors.New("offset and length must not be negative")
 	}
 	service, err := s.gmail(ctx)
 	if err != nil {
 		return AttachmentData{}, err
 	}
-	info, data, err := s.fetchAttachment(ctx, service, messageID, attachmentID, maxBytes)
+	info, data, err := s.fetchAttachment(ctx, service, request.MessageID, request.AttachmentID, 0)
 	if err != nil {
 		return AttachmentData{}, err
 	}
-	out := AttachmentData{Filename: info.Filename, MimeType: info.MimeType, Size: int64(len(data)), DataBase64: base64.StdEncoding.EncodeToString(data)}
-	if strings.HasPrefix(info.MimeType, "text/") || info.MimeType == "application/json" {
+	size := int64(len(data))
+	if request.Offset >= size && !(request.Offset == 0 && size == 0) {
+		return AttachmentData{}, fmt.Errorf("offset %d is past the end of attachment %q (%d bytes)", request.Offset, info.Filename, size)
+	}
+	end := size
+	if request.Length > 0 {
+		end = min(request.Offset+request.Length, size)
+	}
+	if end-request.Offset > maxBytes {
+		return AttachmentData{}, fmt.Errorf("attachment %q is %d bytes from offset %d, over max_bytes %d; download it in pieces with offset and length (for example length 5242880)", info.Filename, end-request.Offset, request.Offset, maxBytes)
+	}
+	chunk := data[request.Offset:end]
+	out := AttachmentData{Filename: info.Filename, MimeType: info.MimeType, Size: size, Offset: request.Offset, Length: int64(len(chunk)), DataBase64: base64.StdEncoding.EncodeToString(chunk)}
+	if end < size {
+		out.NextOffset = end
+	}
+	if out.Complete() && (strings.HasPrefix(info.MimeType, "text/") || info.MimeType == "application/json") {
 		if utf8.Valid(data) {
 			out.Text = string(data)
 		}

@@ -53,14 +53,27 @@ arguments accept IDs (`INBOX`, `UNREAD`, `STARRED`) or label names. Attachments 
 base64 or by reference to an attachment already in the mailbox (`from_message_id` +
 `attachment_id`). `forward_message` includes the original attachments by default.
 
+- `get_thread` cuts each reply's bottom-posted quote of earlier messages (the `> ` lines and
+  the `On ... wrote:` line) and sets `quoted_trimmed`. The first message is never cut, because
+  it may quote mail from outside the thread. Pass `include_quoted` to keep everything.
+- `get_attachment` takes `offset` and `length` to download a large file in pieces. Follow
+  `next_offset` until it is absent. Use 5 MiB pieces through a proxy such as PDW.
+- `send_email` with `thread_id` sends a real reply to the thread's latest message: it sets
+  `In-Reply-To` and `References`, and an empty subject becomes `Re: <thread subject>`. It still
+  sends only to the addresses given. Use `reply_to_message` to answer whoever wrote.
+
 ## Authentication
 
 There are two separate OAuth relationships:
 
 - **Agents → this server.** OAuth 2.1 authorization code with S256 PKCE, dynamic client
   registration, and authorization-server and protected-resource metadata. The authorize page
-  asks for `MCP_SECRET`. Refresh tokens last until revoked, so a client authorizes once. This
-  is the same flow as `zachlatta/tasks`.
+  asks for `MCP_SECRET` and names the client and the host that will receive access. The page
+  cannot be framed, and a wrong secret is answered slowly. Registration is open, as the MCP
+  spec requires, so it is bounded: at most 10 redirect URIs per client and 200 clients in
+  total. The oldest registration is dropped first, and its refresh tokens keep working.
+  Refresh tokens last until revoked, so a client authorizes once. This is the same flow as
+  `zachlatta/tasks`.
 - **This server → Gmail.** A one-time Google consent from the admin page, signed in as the bot
   account. Scopes: `https://mail.google.com/` and `gmail.settings.basic`. The refresh token is
   persisted and refreshed automatically.

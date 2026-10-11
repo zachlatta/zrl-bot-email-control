@@ -164,3 +164,63 @@ func TestReadArchiveAndAttachmentTools(t *testing.T) {
 		t.Fatalf("forward lost attachment:\n%s", raw)
 	}
 }
+
+func TestChunkedAttachmentAndThreadTools(t *testing.T) {
+	session, fake := connect(t)
+	png := []byte("\x89PNG\r\n\x1a\nfake image bytes")
+	id := fake.AddMessage("From: zach@hackclub.com\nTo: zrl-bot@hackclub.com\nSubject: pic\nMessage-ID: <p1@x>\nContent-Type: multipart/mixed; boundary=b\n\n--b\nContent-Type: text/plain\n\nlook\n--b\nContent-Type: image/png\nContent-Disposition: attachment; filename=\"a.png\"\nContent-Transfer-Encoding: base64\n\n"+base64.StdEncoding.EncodeToString(png)+"\n--b--\n", "INBOX")
+	message, _ := fake.Message(id)
+	fake.AddMessageInThread(message.ThreadID, "From: zach@hackclub.com\nTo: zrl-bot@hackclub.com\nSubject: Re: pic\nContent-Type: text/plain\n\nWell?\n\nOn Sun, Oct 11, 2026 at 9:00 AM Zach <zach@hackclub.com> wrote:\n> look\n", "INBOX")
+
+	var chunk mailbox.AttachmentData
+	result := call(t, session, "get_attachment", map[string]any{"message_id": id, "attachment_id": "part:1", "offset": 4, "length": 4})
+	structured(t, result, &chunk)
+	data, _ := base64.StdEncoding.DecodeString(chunk.DataBase64)
+	if string(data) != string(png[4:8]) || chunk.Size != int64(len(png)) || chunk.NextOffset != 8 {
+		t.Fatalf("chunk = %+v (%q)", chunk, data)
+	}
+	for _, content := range result.Content {
+		if _, ok := content.(*mcp.ImageContent); ok {
+			t.Fatal("a partial image was returned as image content")
+		}
+	}
+
+	var thread mailbox.ThreadDetail
+	structured(t, call(t, session, "get_thread", map[string]any{"thread_id": message.ThreadID}), &thread)
+	if got := strings.TrimSpace(thread.Messages[1].Text); got != "Well?" {
+		t.Fatalf("get_thread kept the quote: %q", got)
+	}
+	structured(t, call(t, session, "get_thread", map[string]any{"thread_id": message.ThreadID, "include_quoted": true}), &thread)
+	if !strings.Contains(thread.Messages[1].Text, "> look") {
+		t.Fatalf("include_quoted dropped the quote: %q", thread.Messages[1].Text)
+	}
+}
+
+func TestLabelArgumentsAreDocumented(t *testing.T) {
+	session, _ := connect(t)
+	tools, err := session.ListTools(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range tools.Tools {
+		if tool.Name != "modify_thread_labels" {
+			continue
+		}
+		raw, _ := json.Marshal(tool.InputSchema)
+		var schema struct {
+			Properties map[string]struct {
+				Description string `json:"description"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{"thread_id", "add_labels", "remove_labels"} {
+			if schema.Properties[name].Description == "" {
+				t.Errorf("modify_thread_labels.%s has no description: %s", name, raw)
+			}
+		}
+		return
+	}
+	t.Fatal("modify_thread_labels not found")
+}

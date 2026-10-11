@@ -133,7 +133,10 @@ func (s *FileStore) mutate(apply func()) error {
 
 func (s *FileStore) SaveClient(_ context.Context, client auth.Client) error {
 	client.RedirectURIs = slices.Clone(client.RedirectURIs)
-	return s.mutate(func() { s.state.Clients[client.ID] = client })
+	return s.mutate(func() {
+		s.state.Clients[client.ID] = client
+		auth.EvictOldestClients(s.state.Clients)
+	})
 }
 
 func (s *FileStore) Client(_ context.Context, id string) (auth.Client, bool, error) {

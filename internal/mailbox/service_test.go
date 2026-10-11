@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"mime/quotedprintable"
 	"slices"
@@ -289,7 +290,7 @@ func TestReadSearchAndAttachments(t *testing.T) {
 	if strings.TrimSpace(detail.Text) != "Here are the numbers." || detail.MessageIDHeader != "<orig-1@mail.gmail.com>" || detail.Cc != "zach@zachlatta.com" {
 		t.Fatalf("detail = %#v", detail)
 	}
-	attachment, err := service.GetAttachment(t.Context(), id, detail.Attachments[0].AttachmentID, 0)
+	attachment, err := service.GetAttachment(t.Context(), AttachmentRequest{MessageID: id, AttachmentID: detail.Attachments[0].AttachmentID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,10 +298,10 @@ func TestReadSearchAndAttachments(t *testing.T) {
 	if string(data) != "%PDF-1.4 fake" || attachment.Filename != "q3.pdf" || attachment.MimeType != "application/pdf" {
 		t.Fatalf("attachment = %#v (%q)", attachment, data)
 	}
-	if _, err := service.GetAttachment(t.Context(), id, detail.Attachments[0].AttachmentID, 3); err == nil {
+	if _, err := service.GetAttachment(t.Context(), AttachmentRequest{MessageID: id, AttachmentID: detail.Attachments[0].AttachmentID, MaxBytes: 3}); err == nil {
 		t.Fatal("GetAttachment ignored max_bytes")
 	}
-	thread, err := service.GetThread(t.Context(), detail.ThreadID, GetOptions{})
+	thread, err := service.GetThread(t.Context(), detail.ThreadID, ThreadOptions{})
 	if err != nil || len(thread.Messages) != 1 {
 		t.Fatalf("GetThread = %#v, %v", thread, err)
 	}
@@ -508,8 +509,185 @@ func TestAttachmentIDsAreStableAcrossFetches(t *testing.T) {
 			gmailID = p.Body.AttachmentId
 		}
 	})
-	data, err := service.GetAttachment(t.Context(), id, gmailID, 0)
+	data, err := service.GetAttachment(t.Context(), AttachmentRequest{MessageID: id, AttachmentID: gmailID})
 	if err != nil || data.Size != int64(len("%PDF-1.4 fake")) {
 		t.Fatalf("raw-ID download = %#v, %v", data, err)
+	}
+}
+
+const zachFollowUp = `From: Zach Latta <zach@hackclub.com>
+To: zrl-bot@hackclub.com
+Subject: Re: Quarterly numbers
+Message-ID: <orig-2@mail.gmail.com>
+In-Reply-To: <orig-1@mail.gmail.com>
+References: <root@mail.gmail.com> <orig-1@mail.gmail.com>
+Date: Thu, 08 Oct 2026 12:00:00 -0400
+Content-Type: text/plain; charset=utf-8
+
+Any update?
+
+On Thu, Oct 8, 2026 at 10:00 AM Zach Latta <zach@hackclub.com>
+wrote:
+> Here are the numbers.
+>
+> Thanks
+`
+
+func TestSendIntoThreadRepliesToLatestMessage(t *testing.T) {
+	service, fake := newService(t)
+	first := fake.AddMessage(inboundFromZach, "INBOX")
+	original, _ := fake.Message(first)
+	fake.AddMessageInThread(original.ThreadID, zachFollowUp, "INBOX")
+
+	result, err := service.Send(t.Context(), Outgoing{To: []string{"zach@hackclub.com"}, Text: "Update: done.", ThreadID: original.ThreadID})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if result.ThreadID != original.ThreadID {
+		t.Errorf("thread = %q, want %q", result.ThreadID, original.ThreadID)
+	}
+	raw := string(fake.Sent()[0])
+	for _, want := range []string{"Subject: Re: Quarterly numbers\r\n", "In-Reply-To: <orig-2@mail.gmail.com>", "References: <root@mail.gmail.com> <orig-1@mail.gmail.com> <orig-2@mail.gmail.com>"} {
+		if !strings.Contains(raw, want) {
+			t.Errorf("threaded send missing %q:\n%s", want, raw)
+		}
+	}
+
+	if _, err := service.Send(t.Context(), Outgoing{To: []string{"zach@hackclub.com"}, Subject: "New subject", Text: "x", ThreadID: original.ThreadID}); err != nil {
+		t.Fatal(err)
+	}
+	// The first update is now the thread's latest message, so the second
+	// replies to it.
+	firstUpdateID := strings.SplitN(strings.SplitN(raw, "Message-ID: ", 2)[1], "\r\n", 2)[0]
+	if raw := string(fake.Sent()[1]); !strings.Contains(raw, "Subject: New subject\r\n") || !strings.Contains(raw, "In-Reply-To: "+firstUpdateID) || !strings.Contains(raw, "<orig-2@mail.gmail.com> "+firstUpdateID) {
+		t.Errorf("explicit subject not kept or not threaded after %s:\n%s", firstUpdateID, raw)
+	}
+
+	for name, outgoing := range map[string]Outgoing{
+		"to":  {To: []string{"someone@example.com"}},
+		"cc":  {To: []string{"zach@hackclub.com"}, Cc: []string{"someone@example.com"}},
+		"bcc": {To: []string{"zach@hackclub.com"}, Bcc: []string{"someone@example.com"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			service, fake := newService(t)
+			id := fake.AddMessage(inboundFromZach, "INBOX")
+			message, _ := fake.Message(id)
+			outgoing.ThreadID, outgoing.Text = message.ThreadID, "hi"
+			_, err := service.Send(t.Context(), outgoing)
+			assertBlocked(t, fake, err)
+		})
+	}
+}
+
+func TestGetThreadTrimsQuotedHistory(t *testing.T) {
+	service, fake := newService(t)
+	first := fake.AddMessage(inboundFromZach, "INBOX")
+	original, _ := fake.Message(first)
+	fake.AddMessageInThread(original.ThreadID, zachFollowUp, "INBOX")
+
+	thread, err := service.GetThread(t.Context(), original.ThreadID, ThreadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(thread.Messages[1].Text); got != "Any update?" || !thread.Messages[1].QuotedTrimmed {
+		t.Errorf("follow-up text = %q (trimmed=%v), want only the new text", got, thread.Messages[1].QuotedTrimmed)
+	}
+	if got := strings.TrimSpace(thread.Messages[0].Text); got != "Here are the numbers." || thread.Messages[0].QuotedTrimmed {
+		t.Errorf("first message changed: %q", got)
+	}
+
+	full, err := service.GetThread(t.Context(), original.ThreadID, ThreadOptions{IncludeQuoted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text := full.Messages[1].Text; !strings.Contains(text, "> Here are the numbers.") || full.Messages[1].QuotedTrimmed {
+		t.Errorf("include_quoted dropped the quote: %q", text)
+	}
+}
+
+func TestTrimQuotedKeepsInlineReplies(t *testing.T) {
+	for name, text := range map[string]string{
+		"inline answers": "> question one\nanswer one\n> question two\nanswer two\n",
+		"no quote":       "Just text.\n",
+		"only a quote":   "> all quoted\n",
+	} {
+		got, trimmed := trimQuoted(text)
+		if trimmed || got != text {
+			t.Errorf("%s: trimQuoted changed %q to %q", name, text, got)
+		}
+	}
+	got, trimmed := trimQuoted("Sounds good.\n\nOn Fri, Oct 9, 2026 at 9:00 AM Bot <zrl-bot@hackclub.com> wrote:\n\n> earlier\n> more\n\n")
+	if !trimmed || got != "Sounds good." {
+		t.Errorf("trimQuoted = %q, %v", got, trimmed)
+	}
+}
+
+func TestGetAttachmentInChunks(t *testing.T) {
+	service, fake := newService(t)
+	id := fake.AddMessage(inboundFromZach, "INBOX")
+	detail, _ := service.GetMessage(t.Context(), id, GetOptions{})
+	attachmentID := detail.Attachments[0].AttachmentID
+	const whole = "%PDF-1.4 fake"
+
+	var got []byte
+	offset := int64(0)
+	for range 10 {
+		chunk, err := service.GetAttachment(t.Context(), AttachmentRequest{MessageID: id, AttachmentID: attachmentID, Offset: offset, Length: 5})
+		if err != nil {
+			t.Fatalf("chunk at %d: %v", offset, err)
+		}
+		data, _ := base64.StdEncoding.DecodeString(chunk.DataBase64)
+		if chunk.Size != int64(len(whole)) || chunk.Offset != offset || chunk.Length != int64(len(data)) {
+			t.Fatalf("chunk metadata = %+v", chunk)
+		}
+		got = append(got, data...)
+		if chunk.NextOffset == 0 {
+			break
+		}
+		offset = chunk.NextOffset
+	}
+	if string(got) != whole {
+		t.Fatalf("reassembled %q, want %q", got, whole)
+	}
+	if _, err := service.GetAttachment(t.Context(), AttachmentRequest{MessageID: id, AttachmentID: attachmentID, Offset: 100}); err == nil {
+		t.Fatal("offset past the end was accepted")
+	}
+	_, err := service.GetAttachment(t.Context(), AttachmentRequest{MessageID: id, AttachmentID: attachmentID, MaxBytes: 3})
+	if err == nil || !strings.Contains(err.Error(), "offset") {
+		t.Fatalf("oversized download error should point to offset/length: %v", err)
+	}
+}
+
+func TestSearchKeepsGmailOrder(t *testing.T) {
+	service, fake := newService(t)
+	var ids []string
+	for i := range 12 {
+		ids = append(ids, fake.AddMessage(strings.Replace(inboundFromStranger, "Hello bot", fmt.Sprintf("Hello bot %d", i), 1), "INBOX"))
+	}
+	result, err := service.Search(t.Context(), SearchInput{Query: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, message := range result.Messages {
+		got = append(got, message.ID)
+	}
+	want := slices.Clone(ids)
+	slices.Reverse(want) // the fake lists newest first, like Gmail
+	if !slices.Equal(got, want) {
+		t.Fatalf("search order = %v, want Gmail order %v", got, want)
+	}
+}
+
+func TestForwardEmbedsOnlyTheOriginalBody(t *testing.T) {
+	service, fake := newService(t)
+	id := fake.AddMessage("From: zach@hackclub.com\nTo: zrl-bot@hackclub.com\nSubject: Receipt\nContent-Type: text/html; charset=utf-8\n\n<html><head><title>t</title></head><body><p>Total $5</p></body></html>\n", "INBOX")
+	if _, err := service.Forward(t.Context(), ForwardInput{MessageID: id, To: []string{"zach@hackclub.com"}, Text: "fyi"}); err != nil {
+		t.Fatal(err)
+	}
+	decoded, _ := io.ReadAll(quotedprintable.NewReader(strings.NewReader(string(fake.Sent()[0]))))
+	raw := string(decoded)
+	if !strings.Contains(raw, "<p>Total $5</p>") || strings.Contains(raw, "<html>") || strings.Contains(raw, "<head>") {
+		t.Fatalf("forward should embed only the original body:\n%s", raw)
 	}
 }

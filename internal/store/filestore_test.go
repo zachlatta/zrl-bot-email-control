@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -118,5 +119,30 @@ func TestClearGoogleToken(t *testing.T) {
 	}
 	if _, ok, _ := store.GoogleToken(ctx); ok {
 		t.Fatal("token still present after clear")
+	}
+}
+
+func TestClientRegistrationsAreCapped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, err := Open(path, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := t.Context()
+	start := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	for i := range auth.MaxClients + 5 {
+		client := auth.Client{ID: fmt.Sprintf("client-%03d", i), RedirectURIs: []string{"https://x.example/cb"}, CreatedAt: start.Add(time.Duration(i) * time.Minute)}
+		if err := s.SaveClient(ctx, client); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reopened, err := Open(path, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range map[int]bool{0: false, 4: false, 5: true, auth.MaxClients + 4: true} {
+		if _, ok, _ := reopened.Client(ctx, fmt.Sprintf("client-%03d", i)); ok != want {
+			t.Errorf("client-%03d present = %v, want %v", i, ok, want)
+		}
 	}
 }

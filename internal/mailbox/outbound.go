@@ -66,6 +66,11 @@ func (s *Service) compose(ctx context.Context, service *gmail.Service, outgoing 
 	if err := s.precheck(outgoing.To, outgoing.Cc, outgoing.Bcc); err != nil {
 		return nil, err
 	}
+	if outgoing.ThreadID != "" && outgoing.inReplyTo == "" {
+		if err := s.threadInto(ctx, service, &outgoing); err != nil {
+			return nil, err
+		}
+	}
 	attachments, err := s.loadAttachments(ctx, service, outgoing.Attachments)
 	if err != nil {
 		return nil, err
@@ -75,6 +80,42 @@ func (s *Service) compose(ctx context.Context, service *gmail.Service, outgoing 
 		Subject: outgoing.Subject, Text: outgoing.Text, HTML: outgoing.HTML,
 		Attachments: attachments, InReplyTo: outgoing.inReplyTo, References: outgoing.references,
 	})
+}
+
+// threadInto makes a message sent with a thread_id a real reply to the
+// thread's latest message. Gmail only keeps a message in the thread when its
+// References and Subject match, and recipients' clients thread by
+// In-Reply-To/References, so setting the thread ID alone is not enough. An
+// empty subject becomes "Re: <thread subject>".
+func (s *Service) threadInto(ctx context.Context, service *gmail.Service, outgoing *Outgoing) error {
+	thread, err := service.Users.Threads.Get("me", outgoing.ThreadID).Format("metadata").MetadataHeaders("Subject", "Message-ID", "References").Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("thread %s: %w", outgoing.ThreadID, err)
+	}
+	var latest *gmail.Message
+	for _, message := range thread.Messages {
+		if !slices.Contains(message.LabelIds, "DRAFT") {
+			latest = message
+		}
+	}
+	if latest == nil {
+		return nil
+	}
+	headers := headerMap(latest.Payload)
+	messageID := strings.TrimSpace(headers["message-id"])
+	outgoing.inReplyTo = messageID
+	outgoing.references = strings.TrimSpace(strings.Join(strings.Fields(headers["references"]+" "+messageID), " "))
+	if outgoing.Subject == "" {
+		outgoing.Subject = replySubject(decodeHeader(headers["subject"]))
+	}
+	return nil
+}
+
+func replySubject(subject string) string {
+	if strings.HasPrefix(strings.ToLower(subject), "re:") {
+		return subject
+	}
+	return "Re: " + subject
 }
 
 func (s *Service) loadAttachments(ctx context.Context, service *gmail.Service, inputs []AttachmentInput) ([]mimemsg.Attachment, error) {
@@ -194,11 +235,7 @@ func (s *Service) replyOutgoing(ctx context.Context, service *gmail.Service, inp
 			return Outgoing{}, fmt.Errorf("%w; pass explicit to/cc to redirect the reply to allowed addresses", err)
 		}
 	}
-	subject := decodeHeader(headers["subject"])
-	if !strings.HasPrefix(strings.ToLower(subject), "re:") {
-		subject = "Re: " + subject
-	}
-	outgoing.Subject = subject
+	outgoing.Subject = replySubject(decodeHeader(headers["subject"]))
 	messageID := strings.TrimSpace(headers["message-id"])
 	outgoing.inReplyTo = messageID
 	outgoing.references = strings.TrimSpace(strings.Join(strings.Fields(headers["references"]+" "+messageID), " "))
@@ -264,7 +301,7 @@ func (s *Service) Forward(ctx context.Context, input ForwardInput) (SendResult, 
 		if note == "" {
 			note = "<div>" + strings.ReplaceAll(html.EscapeString(input.Text), "\n", "<br>") + "</div>"
 		}
-		originalHTML := body.HTML
+		originalHTML := htmlBodyContent(body.HTML)
 		if originalHTML == "" {
 			originalHTML = "<pre>" + html.EscapeString(body.Text) + "</pre>"
 		}
@@ -363,18 +400,22 @@ func (s *Service) ListDrafts(ctx context.Context, maxResults int64) ([]DraftSumm
 	if err != nil {
 		return nil, err
 	}
-	drafts := []DraftSummary{}
-	for _, item := range response.Drafts {
-		draft, err := service.Users.Drafts.Get("me", item.Id).Format("full").Context(ctx).Do()
+	drafts := make([]DraftSummary, len(response.Drafts))
+	err = forEachConcurrently(ctx, len(response.Drafts), func(ctx context.Context, i int) error {
+		draft, err := service.Users.Drafts.Get("me", response.Drafts[i].Id).Format("full").Context(ctx).Do()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		summary := DraftSummary{ID: draft.Id}
 		if draft.Message != nil {
 			message := summarize(draft.Message)
 			summary.MessageID, summary.ThreadID, summary.To, summary.Subject, summary.Snippet = message.ID, message.ThreadID, message.To, message.Subject, message.Snippet
 		}
-		drafts = append(drafts, summary)
+		drafts[i] = summary
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return drafts, nil
 }
