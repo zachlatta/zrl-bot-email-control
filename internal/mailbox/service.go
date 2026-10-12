@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"html"
 	"mime"
+	"net/mail"
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/zachlatta/zrl-bot-email-control/internal/recipients"
@@ -97,7 +99,7 @@ type MessageSummary struct {
 	To             string   `json:"to,omitempty"`
 	Cc             string   `json:"cc,omitempty"`
 	Subject        string   `json:"subject"`
-	Date           string   `json:"date"`
+	Date           string   `json:"date" jsonschema:"When Gmail received or sent it, RFC 5322 date in America/New_York."`
 	Snippet        string   `json:"snippet"`
 	LabelIDs       []string `json:"label_ids"`
 	HasAttachments bool     `json:"has_attachments"`
@@ -170,7 +172,7 @@ type ThreadSummary struct {
 	Snippet      string   `json:"snippet"`
 	MessageCount int      `json:"message_count"`
 	Participants []string `json:"participants"`
-	LastDate     string   `json:"last_date"`
+	LastDate     string   `json:"last_date" jsonschema:"Date of the newest message, RFC 5322 date in America/New_York."`
 	LabelIDs     []string `json:"label_ids"`
 }
 
@@ -214,7 +216,7 @@ func (s *Service) SearchThreads(ctx context.Context, input SearchInput) (SearchT
 				summary.Subject = decodeHeader(headers["subject"])
 			}
 			summary.Snippet = html.UnescapeString(message.Snippet)
-			summary.LastDate = headers["date"]
+			summary.LastDate = messageDate(message, headers["date"])
 			from := decodeHeader(headers["from"])
 			if from != "" && !slices.Contains(summary.Participants, from) {
 				summary.Participants = append(summary.Participants, from)
@@ -837,12 +839,26 @@ func decodeHeader(value string) string {
 	return decoded
 }
 
+// messageDate is when Gmail received or sent message, as an RFC 5322 date in
+// Zach's zone. Raw Date headers keep each sender's offset, so a thread's dates
+// would otherwise read out of order. The format stays RFC 5322 because
+// clients such as the email dispatcher parse it as a Date header.
+func messageDate(message *gmail.Message, dateHeader string) string {
+	if message.InternalDate > 0 {
+		return time.UnixMilli(message.InternalDate).In(zachLocation).Format(time.RFC1123Z)
+	}
+	if parsed, err := mail.ParseDate(strings.TrimSpace(dateHeader)); err == nil {
+		return parsed.In(zachLocation).Format(time.RFC1123Z)
+	}
+	return dateHeader
+}
+
 func summarize(message *gmail.Message) MessageSummary {
 	headers := headerMap(message.Payload)
 	summary := MessageSummary{
 		ID: message.Id, ThreadID: message.ThreadId,
 		From: decodeHeader(headers["from"]), To: decodeHeader(headers["to"]), Cc: decodeHeader(headers["cc"]),
-		Subject: decodeHeader(headers["subject"]), Date: headers["date"],
+		Subject: decodeHeader(headers["subject"]), Date: messageDate(message, headers["date"]),
 		Snippet: html.UnescapeString(message.Snippet), LabelIDs: message.LabelIds,
 	}
 	if summary.LabelIDs == nil {

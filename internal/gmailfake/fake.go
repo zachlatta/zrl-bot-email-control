@@ -539,6 +539,11 @@ func (s *Server) render(message *Message, format string) *gmail.Message {
 	if err != nil {
 		return out
 	}
+	// Gmail reports when it received or sent a message; the fake uses the
+	// Date header for that.
+	if date, err := parsed.Header.Date(); err == nil {
+		out.InternalDate = date.UnixMilli()
+	}
 	body, _ := io.ReadAll(parsed.Body)
 	s.renders++
 	counter := s.renders

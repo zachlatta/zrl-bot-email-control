@@ -53,6 +53,11 @@ arguments accept IDs (`INBOX`, `UNREAD`, `STARRED`) or label names. Attachments 
 base64 or by reference to an attachment already in the mailbox (`from_message_id` +
 `attachment_id`). `forward_message` includes the original attachments by default.
 
+- Every `date` and `last_date` is when Gmail received or sent the message, as an RFC 5322 date
+  in America/New_York. Raw `Date` headers keep each sender's offset, so a thread read out of
+  order; the raw header is still in `headers` with `include_headers`.
+- Send, reply, forward and `send_draft` results list the `to`, `cc`, `bcc` and `subject` read
+  from the delivered bytes, so there is no need to fetch the sent message to check them.
 - `get_thread` cuts each reply's bottom-posted quote of earlier messages (the `> ` lines and
   the `On ... wrote:` line) and sets `quoted_trimmed`. The first message is never cut, because
   it may quote mail from outside the thread. Pass `include_quoted` to keep everything.

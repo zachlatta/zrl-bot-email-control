@@ -1,6 +1,7 @@
 package mailbox
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -42,11 +43,27 @@ type Outgoing struct {
 	references string
 }
 
-// SendResult identifies a sent message.
+// SendResult identifies a sent message and says who it went to, read from
+// the exact bytes Gmail delivered.
 type SendResult struct {
 	ID       string   `json:"id"`
 	ThreadID string   `json:"thread_id"`
 	LabelIDs []string `json:"label_ids,omitempty"`
+	To       []string `json:"to,omitempty"`
+	Cc       []string `json:"cc,omitempty"`
+	Bcc      []string `json:"bcc,omitempty"`
+	Subject  string   `json:"subject,omitempty"`
+}
+
+// sendResult describes sent from the raw bytes that were gated and delivered.
+func sendResult(sent *gmail.Message, raw []byte) SendResult {
+	result := SendResult{ID: sent.Id, ThreadID: sent.ThreadId, LabelIDs: sent.LabelIds}
+	if message, err := mail.ReadMessage(bytes.NewReader(raw)); err == nil {
+		header := message.Header
+		result.To, result.Cc, result.Bcc = addressesOf(header.Get("To")), addressesOf(header.Get("Cc")), addressesOf(header.Get("Bcc"))
+		result.Subject = decodeHeader(header.Get("Subject"))
+	}
+	return result
 }
 
 // precheck fails fast, before Gmail is contacted, with a readable error. The
@@ -168,7 +185,7 @@ func (s *Service) Send(ctx context.Context, outgoing Outgoing) (SendResult, erro
 	if err != nil {
 		return SendResult{}, err
 	}
-	return SendResult{ID: sent.Id, ThreadID: sent.ThreadId, LabelIDs: sent.LabelIds}, nil
+	return sendResult(sent, raw), nil
 }
 
 // ReplyInput replies within an existing thread.
@@ -178,8 +195,8 @@ type ReplyInput struct {
 	To              []string          `json:"to,omitempty" jsonschema:"Override the recipients instead of deriving them from the original."`
 	Cc              []string          `json:"cc,omitempty"`
 	Bcc             []string          `json:"bcc,omitempty"`
-	Text            string            `json:"text,omitempty"`
-	HTML            string            `json:"html,omitempty"`
+	Text            string            `json:"text,omitempty" jsonschema:"Plain-text body."`
+	HTML            string            `json:"html,omitempty" jsonschema:"Optional HTML body (sent alongside the text body)."`
 	Attachments     []AttachmentInput `json:"attachments,omitempty"`
 	OmitQuote       bool              `json:"omit_quote,omitempty" jsonschema:"Do not quote the original message below the reply."`
 	SaveAsDraftOnly bool              `json:"-"`
@@ -203,7 +220,7 @@ func (s *Service) Reply(ctx context.Context, input ReplyInput) (SendResult, erro
 	if err != nil {
 		return SendResult{}, err
 	}
-	return SendResult{ID: sent.Id, ThreadID: sent.ThreadId, LabelIDs: sent.LabelIds}, nil
+	return sendResult(sent, raw), nil
 }
 
 func (s *Service) replyOutgoing(ctx context.Context, service *gmail.Service, input ReplyInput) (Outgoing, error) {
@@ -321,7 +338,7 @@ func (s *Service) Forward(ctx context.Context, input ForwardInput) (SendResult, 
 	if err != nil {
 		return SendResult{}, err
 	}
-	return SendResult{ID: sent.Id, ThreadID: sent.ThreadId, LabelIDs: sent.LabelIds}, nil
+	return sendResult(sent, raw), nil
 }
 
 // DraftSummary lists a draft.
@@ -463,7 +480,7 @@ func (s *Service) SendDraft(ctx context.Context, id string) (SendResult, error) 
 	if err := service.Users.Drafts.Delete("me", id).Context(ctx).Do(); err != nil {
 		return SendResult{ID: sent.Id, ThreadID: sent.ThreadId}, fmt.Errorf("sent as %s but could not delete draft %s: %w", sent.Id, id, err)
 	}
-	return SendResult{ID: sent.Id, ThreadID: sent.ThreadId, LabelIDs: sent.LabelIds}, nil
+	return sendResult(sent, raw), nil
 }
 
 func (s *Service) DeleteDraft(ctx context.Context, id string) error {
@@ -506,8 +523,8 @@ func (s *Service) withoutSelf(values []string) []string {
 	return slices.DeleteFunc(values, func(v string) bool { return strings.EqualFold(v, s.cfg.Address) })
 }
 
-// replyLocation is the zone reply attributions are written in (Zach's).
-var replyLocation = func() *time.Location {
+// zachLocation is Zach's zone: reply attributions and every returned date use it.
+var zachLocation = func() *time.Location {
 	location, err := time.LoadLocation("America/New_York")
 	if err != nil {
 		return time.UTC
@@ -520,7 +537,7 @@ var replyLocation = func() *time.Location {
 func replyAttribution(dateHeader, from string) string {
 	when := strings.TrimSpace(dateHeader)
 	if parsed, err := mail.ParseDate(when); err == nil {
-		when = parsed.In(replyLocation).Format("Mon, Jan 2, 2006 at 3:04 PM")
+		when = parsed.In(zachLocation).Format("Mon, Jan 2, 2006 at 3:04 PM")
 	}
 	return fmt.Sprintf("On %s %s wrote:", when, from)
 }

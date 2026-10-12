@@ -691,3 +691,68 @@ func TestForwardEmbedsOnlyTheOriginalBody(t *testing.T) {
 		t.Fatalf("forward should embed only the original body:\n%s", raw)
 	}
 }
+
+// Gmail keeps each sender's Date header offset, so a thread mixes -0400,
+// +0000 and -0700 and its raw dates read out of order. Every date the server
+// returns is the same instant in one zone.
+func TestDatesAreInOneZone(t *testing.T) {
+	service, fake := newService(t)
+	first := fake.AddMessage(strings.Replace(inboundFromZach, "Thu, 08 Oct 2026 10:00:00 -0400", "Thu, 08 Oct 2026 14:00:00 +0000", 1), "INBOX")
+	original, _ := fake.Message(first)
+	fake.AddMessageInThread(original.ThreadID, strings.Replace(zachFollowUp, "Thu, 08 Oct 2026 12:00:00 -0400", "Thu, 08 Oct 2026 09:00:00 -0700", 1), "INBOX")
+
+	thread, err := service.GetThread(t.Context(), original.ThreadID, ThreadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{thread.Messages[0].Date, thread.Messages[1].Date}; !slices.Equal(got, []string{"Thu, 08 Oct 2026 10:00:00 -0400", "Thu, 08 Oct 2026 12:00:00 -0400"}) {
+		t.Errorf("thread dates = %v", got)
+	}
+	search, err := service.Search(t.Context(), SearchInput{})
+	if err != nil || search.Messages[1].Date != "Thu, 08 Oct 2026 10:00:00 -0400" {
+		t.Errorf("search date = %#v, %v", search.Messages, err)
+	}
+	threads, err := service.SearchThreads(t.Context(), SearchInput{})
+	if err != nil || threads.Threads[0].LastDate != "Thu, 08 Oct 2026 12:00:00 -0400" {
+		t.Errorf("thread last_date = %#v, %v", threads.Threads, err)
+	}
+}
+
+// Agents check who a reply went to; the send result says so directly.
+func TestSendResultsListRecipients(t *testing.T) {
+	service, fake := newService(t)
+	id := fake.AddMessage(inboundFromZach, "INBOX")
+
+	sent, err := service.Send(t.Context(), Outgoing{To: []string{"zach@hackclub.com"}, Bcc: []string{"zach@zachlatta.com"}, Subject: "Report", Text: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(sent.To, []string{"zach@hackclub.com"}) || sent.Cc != nil || !slices.Equal(sent.Bcc, []string{"zach@zachlatta.com"}) || sent.Subject != "Report" {
+		t.Errorf("send result = %#v", sent)
+	}
+	reply, err := service.Reply(t.Context(), ReplyInput{MessageID: id, ReplyAll: true, Text: "ok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(reply.To, []string{"zach@hackclub.com"}) || !slices.Equal(reply.Cc, []string{"zach@zachlatta.com"}) || reply.Subject != "Re: Quarterly numbers" {
+		t.Errorf("reply result = %#v", reply)
+	}
+	forward, err := service.Forward(t.Context(), ForwardInput{MessageID: id, To: []string{"zach@zachlatta.com"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(forward.To, []string{"zach@zachlatta.com"}) || forward.Subject != "Fwd: Quarterly numbers" {
+		t.Errorf("forward result = %#v", forward)
+	}
+	draft, err := service.CreateDraft(t.Context(), Outgoing{To: []string{"zach@hackclub.com"}, Subject: "Draft", Text: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromDraft, err := service.SendDraft(t.Context(), draft.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(fromDraft.To, []string{"zach@hackclub.com"}) || fromDraft.Subject != "Draft" {
+		t.Errorf("send_draft result = %#v", fromDraft)
+	}
+}
