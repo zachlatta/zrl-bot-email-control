@@ -113,6 +113,35 @@ func TestSendAllowed(t *testing.T) {
 	}
 }
 
+func TestSendInlineImage(t *testing.T) {
+	service, fake := newService(t)
+	_, err := service.Send(t.Context(), Outgoing{
+		To: []string{"zach@hackclub.com"}, Subject: "photo", Text: "see photo",
+		HTML: `<p>see photo</p><img src="cid:photo1">`,
+		Attachments: []AttachmentInput{
+			{Filename: "photo.jpg", ContentType: "image/jpeg", DataBase64: base64.StdEncoding.EncodeToString([]byte("jpeg")), ContentID: "photo1"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	raw := string(fake.Sent()[0])
+	for _, want := range []string{"multipart/related", "Content-Id: <photo1>", "Content-Disposition: inline"} {
+		if !strings.Contains(raw, want) {
+			t.Errorf("sent message missing %q:\n%s", want, raw)
+		}
+	}
+}
+
+func TestSendInlineImageStillGated(t *testing.T) {
+	service, fake := newService(t)
+	_, err := service.Send(t.Context(), Outgoing{
+		To: []string{"zach@hackclub.com"}, Bcc: []string{"someone@example.com"}, Text: "x", HTML: `<img src="cid:a">`,
+		Attachments: []AttachmentInput{{Filename: "a.png", DataBase64: base64.StdEncoding.EncodeToString([]byte("png")), ContentID: "a"}},
+	})
+	assertBlocked(t, fake, err)
+}
+
 func TestSendBlockedAnywhere(t *testing.T) {
 	for name, outgoing := range map[string]Outgoing{
 		"to":           {To: []string{"someone@example.com"}},

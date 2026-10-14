@@ -26,6 +26,7 @@ type AttachmentInput struct {
 	DataBase64    string `json:"data_base64,omitempty" jsonschema:"Standard base64 file content."`
 	FromMessageID string `json:"from_message_id,omitempty" jsonschema:"Attach an existing attachment from this message ID..."`
 	AttachmentID  string `json:"attachment_id,omitempty" jsonschema:"...identified by this attachment_id from get_message."`
+	ContentID     string `json:"content_id,omitempty" jsonschema:"Show this file inline in the HTML body: set an ID such as photo1 and put <img src=\"cid:photo1\"> in html. Omit for a regular attachment."`
 }
 
 // Outgoing is a new message.
@@ -147,7 +148,7 @@ func (s *Service) loadAttachments(ctx context.Context, service *gmail.Service, i
 			if err != nil {
 				return nil, fmt.Errorf("attachment %q: data_base64 is not valid base64: %w", input.Filename, err)
 			}
-			out = append(out, mimemsg.Attachment{Filename: input.Filename, ContentType: input.ContentType, Data: data})
+			out = append(out, mimemsg.Attachment{Filename: input.Filename, ContentType: input.ContentType, Data: data, ContentID: input.ContentID})
 		case input.DataBase64 == "" && input.FromMessageID != "" && input.AttachmentID != "":
 			info, data, err := s.fetchAttachment(ctx, service, input.FromMessageID, input.AttachmentID, 0)
 			if err != nil {
@@ -160,7 +161,7 @@ func (s *Service) loadAttachments(ctx context.Context, service *gmail.Service, i
 			if input.ContentType != "" {
 				contentType = input.ContentType
 			}
-			out = append(out, mimemsg.Attachment{Filename: filename, ContentType: contentType, Data: data})
+			out = append(out, mimemsg.Attachment{Filename: filename, ContentType: contentType, Data: data, ContentID: input.ContentID})
 		default:
 			return nil, fmt.Errorf("attachment %d: give either data_base64 (with filename) or from_message_id with attachment_id", i)
 		}

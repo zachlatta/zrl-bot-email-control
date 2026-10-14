@@ -24,6 +24,9 @@ type Attachment struct {
 	Filename    string
 	ContentType string
 	Data        []byte
+	// ContentID makes the attachment an inline part that the HTML body shows
+	// with <img src="cid:ContentID">. Empty means a regular attachment.
+	ContentID string
 }
 
 // Message is structured input for Compose. Addresses must be bare addr-specs.
@@ -43,7 +46,8 @@ type Message struct {
 }
 
 // Compose renders a message as multipart/mixed (text and/or HTML alternative,
-// then attachments) with CRLF line endings.
+// then attachments) with CRLF line endings. Attachments with a ContentID go
+// with the body in a multipart/related part, so mail clients show them inline.
 func Compose(message Message) ([]byte, error) {
 	if len(message.To)+len(message.Cc)+len(message.Bcc) == 0 {
 		return nil, errors.New("message needs at least one recipient")
@@ -104,10 +108,25 @@ func Compose(message Message) ([]byte, error) {
 	mixed := multipart.NewWriter(&body)
 	set("Content-Type", mime.FormatMediaType("multipart/mixed", map[string]string{"boundary": mixed.Boundary()}))
 
-	if err := writeAlternative(mixed, message); err != nil {
+	var inline, regular []Attachment
+	for _, attachment := range message.Attachments {
+		if attachment.ContentID == "" {
+			regular = append(regular, attachment)
+			continue
+		}
+		if err := checkContentID(attachment.ContentID); err != nil {
+			return nil, fmt.Errorf("attachment %q: %w", attachment.Filename, err)
+		}
+		inline = append(inline, attachment)
+	}
+	if len(inline) == 0 {
+		if err := writeAlternative(mixed, message); err != nil {
+			return nil, err
+		}
+	} else if err := writeRelated(mixed, message, inline); err != nil {
 		return nil, err
 	}
-	for _, attachment := range message.Attachments {
+	for _, attachment := range regular {
 		if err := writeAttachment(mixed, attachment); err != nil {
 			return nil, err
 		}
@@ -159,6 +178,47 @@ func writeAlternative(mixed *multipart.Writer, message Message) error {
 	return err
 }
 
+// writeRelated writes a multipart/related part holding the body alternative
+// and the inline parts it references by Content-ID.
+func writeRelated(mixed *multipart.Writer, message Message, inline []Attachment) error {
+	var buffer bytes.Buffer
+	related := multipart.NewWriter(&buffer)
+	if err := writeAlternative(related, message); err != nil {
+		return err
+	}
+	for _, attachment := range inline {
+		if err := writeAttachment(related, attachment); err != nil {
+			return err
+		}
+	}
+	if err := related.Close(); err != nil {
+		return err
+	}
+	header := textproto.MIMEHeader{}
+	header.Set("Content-Type", mime.FormatMediaType("multipart/related", map[string]string{"boundary": related.Boundary(), "type": "multipart/alternative"}))
+	part, err := mixed.CreatePart(header)
+	if err != nil {
+		return err
+	}
+	_, err = part.Write(buffer.Bytes())
+	return err
+}
+
+// checkContentID accepts the dot-atom style IDs agents pass (letters, digits
+// and . _ - + @), so the value cannot break out of the Content-ID header.
+func checkContentID(id string) error {
+	if len(id) > 200 {
+		return errors.New("content_id is longer than 200 characters")
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.IndexByte("._-+@", c) >= 0) {
+			return fmt.Errorf("content_id %q may only contain letters, digits and . _ - + @", id)
+		}
+	}
+	return nil
+}
+
 func writeAttachment(writer *multipart.Writer, attachment Attachment) error {
 	filename := attachment.Filename
 	if filename == "" {
@@ -181,7 +241,12 @@ func writeAttachment(writer *multipart.Writer, attachment Attachment) error {
 	params["name"] = filename
 	header := textproto.MIMEHeader{}
 	header.Set("Content-Type", mime.FormatMediaType(mediaType, params))
-	header.Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filename}))
+	disposition := "attachment"
+	if attachment.ContentID != "" {
+		disposition = "inline"
+		header.Set("Content-ID", "<"+attachment.ContentID+">")
+	}
+	header.Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": filename}))
 	header.Set("Content-Transfer-Encoding", "base64")
 	part, err := writer.CreatePart(header)
 	if err != nil {
