@@ -58,9 +58,16 @@ base64 or by reference to an attachment already in the mailbox (`from_message_id
   order; the raw header is still in `headers` with `include_headers`.
 - Send, reply, forward and `send_draft` results list the `to`, `cc`, `bcc` and `subject` read
   from the delivered bytes, so there is no need to fetch the sent message to check them.
+- `reply_to_message` with `archive_thread` archives the thread after the reply is sent and sets
+  `archived`. A blocked or failed send archives nothing. If the archive alone fails, the result
+  carries `archive_error`; the reply was still sent and must not be resent.
 - `get_thread` cuts each reply's bottom-posted quote of earlier messages (the `> ` lines and
   the `On ... wrote:` line) and sets `quoted_trimmed`. The first message is never cut, because
   it may quote mail from outside the thread. Pass `include_quoted` to keep everything.
+- `get_thread` with `latest: N` returns only the newest N messages; `message_count` is always
+  the whole thread. Threading headers (`Message-ID`, `In-Reply-To`, `References`) are left out
+  of message details, because the server threads replies itself and `References` grows with
+  every reply. They are still in `headers` with `include_headers`.
 - `get_attachment` takes `offset` and `length` to download a large file in pieces. Follow
   `next_offset` until it is absent. Use 5 MiB pieces through a proxy such as PDW.
 - `send_email` with `thread_id` sends a real reply to the thread's latest message: it sets

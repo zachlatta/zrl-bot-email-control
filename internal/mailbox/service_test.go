@@ -3,6 +3,7 @@ package mailbox
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -316,7 +317,7 @@ func TestReadSearchAndAttachments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(detail.Text) != "Here are the numbers." || detail.MessageIDHeader != "<orig-1@mail.gmail.com>" || detail.Cc != "zach@zachlatta.com" {
+	if strings.TrimSpace(detail.Text) != "Here are the numbers." || detail.Cc != "zach@zachlatta.com" {
 		t.Fatalf("detail = %#v", detail)
 	}
 	attachment, err := service.GetAttachment(t.Context(), AttachmentRequest{MessageID: id, AttachmentID: detail.Attachments[0].AttachmentID})
@@ -783,5 +784,97 @@ func TestSendResultsListRecipients(t *testing.T) {
 	}
 	if !slices.Equal(fromDraft.To, []string{"zach@hackclub.com"}) || fromDraft.Subject != "Draft" {
 		t.Errorf("send_draft result = %#v", fromDraft)
+	}
+}
+
+func TestMessageDetailLeavesOutThreadingHeaders(t *testing.T) {
+	service, fake := newService(t)
+	id := fake.AddMessage(inboundFromZach, "INBOX")
+	original, _ := fake.Message(id)
+	fake.AddMessageInThread(original.ThreadID, zachFollowUp, "INBOX")
+
+	thread, err := service.GetThread(t.Context(), original.ThreadID, ThreadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(thread)
+	for _, key := range []string{`"references"`, `"message_id_header"`, `"in_reply_to"`} {
+		if strings.Contains(string(encoded), key) {
+			t.Errorf("get_thread output has %s, which grows with every reply:\n%s", key, encoded)
+		}
+	}
+	withHeaders, err := service.GetMessage(t.Context(), id, GetOptions{IncludeHeaders: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(withHeaders.Headers, func(h Header) bool {
+		return strings.EqualFold(h.Name, "Message-ID") && h.Value == "<orig-1@mail.gmail.com>"
+	}) {
+		t.Errorf("include_headers lost Message-ID: %#v", withHeaders.Headers)
+	}
+}
+
+func TestGetThreadLatest(t *testing.T) {
+	service, fake := newService(t)
+	first := fake.AddMessage(inboundFromZach, "INBOX")
+	original, _ := fake.Message(first)
+	followUp := fake.AddMessageInThread(original.ThreadID, zachFollowUp, "INBOX")
+
+	thread, err := service.GetThread(t.Context(), original.ThreadID, ThreadOptions{Latest: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if thread.MessageCount != 2 || len(thread.Messages) != 1 || thread.Messages[0].ID != followUp {
+		t.Fatalf("latest 1 = count %d, %d messages, want only %s", thread.MessageCount, len(thread.Messages), followUp)
+	}
+	if got := strings.TrimSpace(thread.Messages[0].Text); got != "Any update?" {
+		t.Errorf("latest message not trimmed: %q", got)
+	}
+	all, err := service.GetThread(t.Context(), original.ThreadID, ThreadOptions{Latest: 5})
+	if err != nil || all.MessageCount != 2 || len(all.Messages) != 2 {
+		t.Fatalf("latest beyond length = %#v, %v", all, err)
+	}
+	if got := strings.TrimSpace(all.Messages[0].Text); got != "Here are the numbers." {
+		t.Errorf("first message changed: %q", got)
+	}
+}
+
+func TestReplyArchivesThread(t *testing.T) {
+	service, fake := newService(t)
+	first := fake.AddMessage(inboundFromZach, "INBOX")
+	original, _ := fake.Message(first)
+	latest := fake.AddMessageInThread(original.ThreadID, zachFollowUp, "INBOX", "UNREAD")
+
+	result, err := service.Reply(t.Context(), ReplyInput{MessageID: latest, Text: "Done.", ArchiveThread: true})
+	if err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+	if !result.Archived || result.ArchiveError != "" || len(fake.Sent()) != 1 {
+		t.Fatalf("result = %#v, sent %d", result, len(fake.Sent()))
+	}
+	for _, id := range []string{first, latest} {
+		if message, _ := fake.Message(id); slices.Contains(message.LabelIDs, "INBOX") {
+			t.Errorf("%s still in inbox: %v", id, message.LabelIDs)
+		}
+	}
+}
+
+func TestBlockedReplyDoesNotArchive(t *testing.T) {
+	for name, input := range map[string]ReplyInput{
+		"sender": {},
+		"to":     {To: []string{"someone@example.com"}},
+		"cc":     {To: []string{"zach@hackclub.com"}, Cc: []string{"someone@example.com"}},
+		"bcc":    {To: []string{"zach@hackclub.com"}, Bcc: []string{"someone@example.com"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			service, fake := newService(t)
+			id := fake.AddMessage(inboundFromStranger, "INBOX")
+			input.MessageID, input.Text, input.ArchiveThread = id, "sure", true
+			_, err := service.Reply(t.Context(), input)
+			assertBlocked(t, fake, err)
+			if message, _ := fake.Message(id); !slices.Contains(message.LabelIDs, "INBOX") {
+				t.Errorf("blocked reply archived the thread: %v", message.LabelIDs)
+			}
+		})
 	}
 }

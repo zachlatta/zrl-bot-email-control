@@ -224,3 +224,47 @@ func TestLabelArgumentsAreDocumented(t *testing.T) {
 	}
 	t.Fatal("modify_thread_labels not found")
 }
+
+func TestReplyToolArchivesThread(t *testing.T) {
+	session, fake := connect(t)
+	id := fake.AddMessage("From: zach@hackclub.com\nTo: zrl-bot@hackclub.com\nSubject: task\nMessage-ID: <t1@x>\nContent-Type: text/plain\n\nDo it\n", "INBOX", "UNREAD")
+
+	var sent mailbox.SendResult
+	structured(t, call(t, session, "reply_to_message", map[string]any{"message_id": id, "text": "Done.", "archive_thread": true}), &sent)
+	if !sent.Archived || len(fake.Sent()) != 1 {
+		t.Fatalf("reply = %#v, delivered %d", sent, len(fake.Sent()))
+	}
+	if message, _ := fake.Message(id); slices.Contains(message.LabelIDs, "INBOX") {
+		t.Fatalf("thread not archived: %v", message.LabelIDs)
+	}
+
+	stranger := fake.AddMessage("From: someone@example.com\nTo: zrl-bot@hackclub.com\nSubject: hi\nContent-Type: text/plain\n\nhi\n", "INBOX")
+	for _, args := range []map[string]any{
+		{"to": []string{"spy@example.com"}},
+		{"to": []string{"zach@hackclub.com"}, "cc": []string{"spy@example.com"}},
+		{"to": []string{"zach@hackclub.com"}, "bcc": []string{"spy@example.com"}},
+	} {
+		args["message_id"], args["text"], args["archive_thread"] = stranger, "x", true
+		if blocked := call(t, session, "reply_to_message", args); !blocked.IsError || len(fake.Sent()) != 1 {
+			t.Fatalf("reply %v not blocked: %q, delivered %d", args, text(blocked), len(fake.Sent()))
+		}
+		if message, _ := fake.Message(stranger); !slices.Contains(message.LabelIDs, "INBOX") {
+			t.Fatalf("blocked reply archived the thread: %v", message.LabelIDs)
+		}
+	}
+}
+
+func TestArchiveThreadOnlyOnReplyTool(t *testing.T) {
+	session, _ := connect(t)
+	tools, err := session.ListTools(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range tools.Tools {
+		raw, _ := json.Marshal(tool.InputSchema)
+		has := strings.Contains(string(raw), `"archive_thread"`)
+		if want := tool.Name == "reply_to_message"; has != want {
+			t.Errorf("%s: archive_thread in schema = %v, want %v", tool.Name, has, want)
+		}
+	}
+}

@@ -50,6 +50,11 @@ type GetThreadInput struct {
 	mailbox.ThreadOptions
 }
 
+type ReplyToMessageInput struct {
+	mailbox.ReplyInput
+	ArchiveThread bool `json:"archive_thread,omitempty" jsonschema:"After the reply is sent, archive the whole thread (remove INBOX). Nothing is archived if the send fails."`
+}
+
 type DraftIDInput struct {
 	DraftID string `json:"draft_id"`
 }
@@ -117,7 +122,7 @@ func New(service *mailbox.Service, version string) *mcp.Server {
 		func(ctx context.Context, input GetMessageInput) (mailbox.MessageDetail, error) {
 			return service.GetMessage(ctx, input.MessageID, input.GetOptions)
 		})
-	add(server, "get_thread", "Read every message in a conversation, oldest first. Each reply's quoted copy of earlier messages is cut from its text (quoted_trimmed is set); pass include_quoted to keep it. The last message is the one to answer with reply_to_message.", readOnly,
+	add(server, "get_thread", "Read every message in a conversation, oldest first. Each reply's quoted copy of earlier messages is cut from its text (quoted_trimmed is set); pass include_quoted to keep it. Pass latest (e.g. 3) to get only the newest messages of a long thread. The last message is the one to answer with reply_to_message.", readOnly,
 		func(ctx context.Context, input GetThreadInput) (mailbox.ThreadDetail, error) {
 			return service.GetThread(ctx, input.ThreadID, input.ThreadOptions)
 		})
@@ -143,8 +148,11 @@ func New(service *mailbox.Service, version string) *mcp.Server {
 
 	add(server, "send_email", "Send a new email (text and/or HTML, with attachments as base64 or references to existing attachments). Every To/Cc/Bcc address must be allowlisted. To answer a message, use reply_to_message instead: it addresses whoever wrote. With thread_id, the email is sent as a reply to the thread's latest message (subject defaults to \"Re: <thread subject>\"), but still only to the to/cc/bcc you give.", outbound,
 		service.Send)
-	add(server, "reply_to_message", "Reply in-thread to a message. Recipients default to the sender, or the Reply-To address (plus original To/Cc with reply_all); pass to/cc to override. The original is quoted unless omit_quote is set. Text and/or HTML body, attachments as in send_email.", outbound,
-		service.Reply)
+	add(server, "reply_to_message", "Reply in-thread to a message. Recipients default to the sender, or the Reply-To address (plus original To/Cc with reply_all); pass to/cc to override. The original is quoted unless omit_quote is set. Text and/or HTML body, attachments as in send_email. Pass archive_thread to archive the thread once the reply is sent. The result lists the delivered to/cc/bcc/subject.", outbound,
+		func(ctx context.Context, input ReplyToMessageInput) (mailbox.SendResult, error) {
+			input.ReplyInput.ArchiveThread = input.ArchiveThread
+			return service.Reply(ctx, input.ReplyInput)
+		})
 	add(server, "forward_message", "Forward a message, including its attachments by default, with an optional note.", outbound,
 		service.Forward)
 

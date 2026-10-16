@@ -54,6 +54,10 @@ type SendResult struct {
 	Cc       []string `json:"cc,omitempty"`
 	Bcc      []string `json:"bcc,omitempty"`
 	Subject  string   `json:"subject,omitempty"`
+	Archived bool     `json:"archived,omitempty" jsonschema:"The thread was archived after sending (archive_thread)."`
+	// ArchiveError reports a failed archive_thread. The message was still
+	// sent, so it is not an error: failing the call would invite a resend.
+	ArchiveError string `json:"archive_error,omitempty" jsonschema:"The reply WAS sent, but archiving the thread failed; do not resend, archive it with modify_thread_labels."`
 }
 
 // sendResult describes sent from the raw bytes that were gated and delivered.
@@ -201,6 +205,8 @@ type ReplyInput struct {
 	Attachments     []AttachmentInput `json:"attachments,omitempty"`
 	OmitQuote       bool              `json:"omit_quote,omitempty" jsonschema:"Do not quote the original message below the reply."`
 	SaveAsDraftOnly bool              `json:"-"`
+	// ArchiveThread is set by reply_to_message only; drafts never archive.
+	ArchiveThread bool `json:"-"`
 }
 
 // Reply sends a threaded reply.
@@ -221,7 +227,15 @@ func (s *Service) Reply(ctx context.Context, input ReplyInput) (SendResult, erro
 	if err != nil {
 		return SendResult{}, err
 	}
-	return sendResult(sent, raw), nil
+	result := sendResult(sent, raw)
+	if input.ArchiveThread {
+		if err := s.ModifyThread(ctx, sent.ThreadId, nil, []string{"INBOX"}); err != nil {
+			result.ArchiveError = err.Error()
+		} else {
+			result.Archived = true
+		}
+	}
+	return result, nil
 }
 
 func (s *Service) replyOutgoing(ctx context.Context, service *gmail.Service, input ReplyInput) (Outgoing, error) {

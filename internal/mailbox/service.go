@@ -261,17 +261,14 @@ type Header struct {
 // MessageDetail is a fully decoded message.
 type MessageDetail struct {
 	MessageSummary
-	Bcc             string           `json:"bcc,omitempty"`
-	ReplyTo         string           `json:"reply_to,omitempty"`
-	MessageIDHeader string           `json:"message_id_header,omitempty"`
-	InReplyTo       string           `json:"in_reply_to,omitempty"`
-	References      string           `json:"references,omitempty"`
-	Text            string           `json:"text"`
-	HTML            string           `json:"html,omitempty"`
-	Truncated       bool             `json:"truncated,omitempty"`
-	QuotedTrimmed   bool             `json:"quoted_trimmed,omitempty" jsonschema:"Quoted earlier messages were cut from the end of text; pass include_quoted to keep them."`
-	Attachments     []AttachmentInfo `json:"attachments"`
-	Headers         []Header         `json:"headers,omitempty"`
+	Bcc           string           `json:"bcc,omitempty"`
+	ReplyTo       string           `json:"reply_to,omitempty"`
+	Text          string           `json:"text"`
+	HTML          string           `json:"html,omitempty"`
+	Truncated     bool             `json:"truncated,omitempty"`
+	QuotedTrimmed bool             `json:"quoted_trimmed,omitempty" jsonschema:"Quoted earlier messages were cut from the end of text; pass include_quoted to keep them."`
+	Attachments   []AttachmentInfo `json:"attachments"`
+	Headers       []Header         `json:"headers,omitempty"`
 }
 
 func (s *Service) GetMessage(ctx context.Context, id string, options GetOptions) (MessageDetail, error) {
@@ -290,12 +287,14 @@ func (s *Service) GetMessage(ctx context.Context, id string, options GetOptions)
 type ThreadOptions struct {
 	GetOptions
 	IncludeQuoted bool `json:"include_quoted,omitempty" jsonschema:"Keep the quoted earlier messages ('> ...' lines and the 'On ... wrote:' line) at the end of each reply's text. By default they are cut, because the thread already contains those messages. The first message is never cut."`
+	Latest        int  `json:"latest,omitempty" jsonschema:"Only return the newest N messages, e.g. 1 for just the message to answer. message_count is still the whole thread. Default: every message."`
 }
 
 // ThreadDetail is every message of a thread, oldest first.
 type ThreadDetail struct {
-	ID       string          `json:"id"`
-	Messages []MessageDetail `json:"messages"`
+	ID           string          `json:"id"`
+	MessageCount int             `json:"message_count" jsonschema:"Messages in the whole thread, including any left out by latest."`
+	Messages     []MessageDetail `json:"messages"`
 }
 
 func (s *Service) GetThread(ctx context.Context, id string, options ThreadOptions) (ThreadDetail, error) {
@@ -307,8 +306,13 @@ func (s *Service) GetThread(ctx context.Context, id string, options ThreadOption
 	if err != nil {
 		return ThreadDetail{}, err
 	}
-	out := ThreadDetail{ID: thread.Id, Messages: []MessageDetail{}}
-	for i, message := range thread.Messages {
+	out := ThreadDetail{ID: thread.Id, MessageCount: len(thread.Messages), Messages: []MessageDetail{}}
+	skip := 0
+	if options.Latest > 0 {
+		skip = max(0, len(thread.Messages)-options.Latest)
+	}
+	for i, message := range thread.Messages[skip:] {
+		i += skip
 		message := detail(message, options.GetOptions)
 		// The first message may quote mail that is not in this thread (Zach
 		// copying the bot into an existing conversation), so it is kept whole.
@@ -877,7 +881,6 @@ func detail(message *gmail.Message, options GetOptions) MessageDetail {
 	out := MessageDetail{
 		MessageSummary: summarize(message),
 		Bcc:            decodeHeader(headers["bcc"]), ReplyTo: decodeHeader(headers["reply-to"]),
-		MessageIDHeader: headers["message-id"], InReplyTo: headers["in-reply-to"], References: headers["references"],
 		Attachments: []AttachmentInfo{},
 	}
 	var text, htmlBody string
