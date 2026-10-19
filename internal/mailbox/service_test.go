@@ -247,6 +247,43 @@ func TestReplyToStrangerBlocked(t *testing.T) {
 	assertBlocked(t, fake, err)
 }
 
+// A reply to the bot's own message (such as a voice-memo task email that
+// starts a thread) goes to that message's recipients, not back to the bot.
+func TestReplyToOwnMessageGoesToItsRecipients(t *testing.T) {
+	service, fake := newService(t)
+	id := fake.AddMessage("From: zrl-bot@hackclub.com\nTo: zach@zachlatta.com\nSubject: Voice memo task: call the vet\nMessage-ID: <own-1@zrl-bot-email-control>\n\nOn it.\n", "SENT")
+	result, err := service.Reply(t.Context(), ReplyInput{MessageID: id, Text: "Booked for Monday.", OmitQuote: true})
+	if err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+	if !slices.Equal(result.To, []string{"zach@zachlatta.com"}) {
+		t.Errorf("reply to = %v, want [zach@zachlatta.com]", result.To)
+	}
+}
+
+func TestReplyToOwnMessageToStrangerBlocked(t *testing.T) {
+	service, fake := newService(t)
+	for _, header := range []string{"To: someone@example.com", "To: zach@hackclub.com\nCc: someone@example.com", "To: zach@hackclub.com\nBcc: someone@example.com"} {
+		id := fake.AddMessage("From: zrl-bot@hackclub.com\n"+header+"\nSubject: Old note\nMessage-ID: <own-2@zrl-bot-email-control>\n\nHi.\n", "SENT")
+		if header == "To: someone@example.com" {
+			_, err := service.Reply(t.Context(), ReplyInput{MessageID: id, Text: "again"})
+			assertBlocked(t, fake, err)
+		}
+		_, err := service.Reply(t.Context(), ReplyInput{MessageID: id, ReplyAll: true, Text: "again"})
+		if strings.Contains(header, "Bcc") {
+			// Bcc is never carried into a reply; the reply goes to To only.
+			if err != nil {
+				t.Fatalf("reply-all to own message with Bcc: %v", err)
+			}
+			if raw := string(fake.Sent()[len(fake.Sent())-1]); strings.Contains(raw, "someone@example.com") {
+				t.Fatalf("Bcc recipient leaked into reply:\n%s", raw)
+			}
+			continue
+		}
+		assertBlocked(t, fake, err)
+	}
+}
+
 func TestReplyWithExplicitRecipientsOverride(t *testing.T) {
 	service, fake := newService(t)
 	id := fake.AddMessage(inboundFromStranger, "INBOX")

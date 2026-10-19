@@ -70,6 +70,9 @@ base64 or by reference to an attachment already in the mailbox (`from_message_id
   every reply. They are still in `headers` with `include_headers`.
 - `get_attachment` takes `offset` and `length` to download a large file in pieces. Follow
   `next_offset` until it is absent. Use 5 MiB pieces through a proxy such as PDW.
+- `reply_to_message` answers the sender, or the `Reply-To` address. Replying to a message this
+  mailbox sent goes to that message's `To`, so no `to` is needed to follow up on the bot's own
+  email.
 - `send_email` with `thread_id` sends a real reply to the thread's latest message: it sets
   `In-Reply-To` and `References`, and an empty subject becomes `Re: <thread subject>`. It still
   sends only to the addresses given. Use `reply_to_message` to answer whoever wrote.

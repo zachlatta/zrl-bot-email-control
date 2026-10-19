@@ -148,7 +148,7 @@ func New(service *mailbox.Service, version string) *mcp.Server {
 
 	add(server, "send_email", "Send a new email (text and/or HTML, with attachments as base64 or references to existing attachments). Every To/Cc/Bcc address must be allowlisted. To answer a message, use reply_to_message instead: it addresses whoever wrote. With thread_id, the email is sent as a reply to the thread's latest message (subject defaults to \"Re: <thread subject>\"), but still only to the to/cc/bcc you give.", outbound,
 		service.Send)
-	add(server, "reply_to_message", "Reply in-thread to a message. Recipients default to the sender, or the Reply-To address (plus original To/Cc with reply_all); pass to/cc to override. The original is quoted unless omit_quote is set. Text and/or HTML body, attachments as in send_email. Pass archive_thread to archive the thread once the reply is sent. The result lists the delivered to/cc/bcc/subject.", outbound,
+	add(server, "reply_to_message", "Reply in-thread to a message. Recipients default to the sender, or the Reply-To address (plus original To/Cc with reply_all); when the message was sent by this mailbox, they default to its original To. Pass to/cc to override. The original is quoted unless omit_quote is set. Text and/or HTML body, attachments as in send_email. Pass archive_thread to archive the thread once the reply is sent. The result lists the delivered to/cc/bcc/subject.", outbound,
 		func(ctx context.Context, input ReplyToMessageInput) (mailbox.SendResult, error) {
 			input.ReplyInput.ArchiveThread = input.ArchiveThread
 			return service.Reply(ctx, input.ReplyInput)
