@@ -143,6 +143,27 @@ func TestSendInlineImageStillGated(t *testing.T) {
 	assertBlocked(t, fake, err)
 }
 
+// reply_to sets Reply-To, so a note the bot files in its own inbox (To: the
+// bot) is answered at Zach's address. Reply-To must be allowlisted too.
+func TestSendWithReplyTo(t *testing.T) {
+	service, fake := newService(t)
+	_, err := service.Send(t.Context(), Outgoing{To: []string{"zach@hackclub.com"}, ReplyTo: []string{"zach@zachlatta.com"}, Subject: "Task", Text: "Started."})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if raw := string(fake.Sent()[0]); !strings.Contains(raw, "Reply-To: zach@zachlatta.com") {
+		t.Errorf("sent message missing Reply-To:\n%s", raw)
+	}
+}
+
+func TestSendReplyToStrangerBlocked(t *testing.T) {
+	for _, replyTo := range []string{"someone@example.com", "Zach <zach@hackclub.com>"} {
+		service, fake := newService(t)
+		_, err := service.Send(t.Context(), Outgoing{To: []string{"zach@hackclub.com"}, ReplyTo: []string{replyTo}, Text: "hi"})
+		assertBlocked(t, fake, err)
+	}
+}
+
 func TestSendBlockedAnywhere(t *testing.T) {
 	for name, outgoing := range map[string]Outgoing{
 		"to":           {To: []string{"someone@example.com"}},
@@ -252,6 +273,20 @@ func TestReplyToStrangerBlocked(t *testing.T) {
 func TestReplyToOwnMessageGoesToItsRecipients(t *testing.T) {
 	service, fake := newService(t)
 	id := fake.AddMessage("From: zrl-bot@hackclub.com\nTo: zach@zachlatta.com\nSubject: Voice memo task: call the vet\nMessage-ID: <own-1@zrl-bot-email-control>\n\nOn it.\n", "SENT")
+	result, err := service.Reply(t.Context(), ReplyInput{MessageID: id, Text: "Booked for Monday.", OmitQuote: true})
+	if err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+	if !slices.Equal(result.To, []string{"zach@zachlatta.com"}) {
+		t.Errorf("reply to = %v, want [zach@zachlatta.com]", result.To)
+	}
+}
+
+// A note the bot sent to itself with Reply-To (a voice-memo task email filed
+// quietly in its own inbox) is answered at the Reply-To address.
+func TestReplyToOwnMessageUsesReplyTo(t *testing.T) {
+	service, fake := newService(t)
+	id := fake.AddMessage("From: zrl-bot@hackclub.com\nTo: zrl-bot@hackclub.com\nReply-To: zach@zachlatta.com\nSubject: Voice memo task: call the vet\nMessage-ID: <own-3@zrl-bot-email-control>\n\nOn it.\n", "SENT", "INBOX")
 	result, err := service.Reply(t.Context(), ReplyInput{MessageID: id, Text: "Booked for Monday.", OmitQuote: true})
 	if err != nil {
 		t.Fatalf("Reply: %v", err)

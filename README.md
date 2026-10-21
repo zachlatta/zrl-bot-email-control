@@ -71,8 +71,11 @@ base64 or by reference to an attachment already in the mailbox (`from_message_id
 - `get_attachment` takes `offset` and `length` to download a large file in pieces. Follow
   `next_offset` until it is absent. Use 5 MiB pieces through a proxy such as PDW.
 - `reply_to_message` answers the sender, or the `Reply-To` address. Replying to a message this
-  mailbox sent goes to that message's `To`, so no `to` is needed to follow up on the bot's own
-  email.
+  mailbox sent goes to that message's `Reply-To`, else its `To`, so no `to` is needed to follow
+  up on the bot's own email.
+- `send_email` takes `reply_to` (allowlisted addresses). To file a note quietly in the bot's own
+  inbox, send it to the bot (put the bot's address in `ALLOWED_RECIPIENTS`) with `reply_to` set to
+  the human: nobody is notified, and a later `reply_to_message` on it reaches the human.
 - `send_email` with `thread_id` sends a real reply to the thread's latest message: it sets
   `In-Reply-To` and `References`, and an empty subject becomes `Re: <thread subject>`. It still
   sends only to the addresses given. Use `reply_to_message` to answer whoever wrote.

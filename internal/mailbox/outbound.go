@@ -34,6 +34,7 @@ type Outgoing struct {
 	To          []string          `json:"to,omitempty" jsonschema:"Bare email addresses. Every To/Cc/Bcc address must be on the allowlist."`
 	Cc          []string          `json:"cc,omitempty"`
 	Bcc         []string          `json:"bcc,omitempty"`
+	ReplyTo     []string          `json:"reply_to,omitempty" jsonschema:"Optional Reply-To addresses (allowlisted). Replies, including reply_to_message on this message, go here."`
 	Subject     string            `json:"subject,omitempty"`
 	Text        string            `json:"text,omitempty" jsonschema:"Plain-text body."`
 	HTML        string            `json:"html,omitempty" jsonschema:"Optional HTML body (sent alongside the text body)."`
@@ -88,6 +89,11 @@ func (s *Service) compose(ctx context.Context, service *gmail.Service, outgoing 
 	if err := s.precheck(outgoing.To, outgoing.Cc, outgoing.Bcc); err != nil {
 		return nil, err
 	}
+	if len(outgoing.ReplyTo) > 0 {
+		if err := s.precheck(outgoing.ReplyTo); err != nil {
+			return nil, fmt.Errorf("reply_to: %w", err)
+		}
+	}
 	if outgoing.ThreadID != "" && outgoing.inReplyTo == "" {
 		if err := s.threadInto(ctx, service, &outgoing); err != nil {
 			return nil, err
@@ -98,7 +104,7 @@ func (s *Service) compose(ctx context.Context, service *gmail.Service, outgoing 
 		return nil, err
 	}
 	return mimemsg.Compose(mimemsg.Message{
-		From: s.cfg.Address, To: outgoing.To, Cc: outgoing.Cc, Bcc: outgoing.Bcc,
+		From: s.cfg.Address, To: outgoing.To, Cc: outgoing.Cc, Bcc: outgoing.Bcc, ReplyTo: outgoing.ReplyTo,
 		Subject: outgoing.Subject, Text: outgoing.Text, HTML: outgoing.HTML,
 		Attachments: attachments, InReplyTo: outgoing.inReplyTo, References: outgoing.references,
 	})
@@ -251,10 +257,10 @@ func (s *Service) replyOutgoing(ctx context.Context, service *gmail.Service, inp
 	if len(input.To)+len(input.Cc)+len(input.Bcc) == 0 {
 		from := addressesOf(headers["from"])
 		switch {
-		case len(from) == 1 && strings.EqualFold(from[0], s.cfg.Address):
-			outgoing.To = addressesOf(headers["to"])
 		case headers["reply-to"] != "":
 			outgoing.To = addressesOf(headers["reply-to"])
+		case len(from) == 1 && strings.EqualFold(from[0], s.cfg.Address):
+			outgoing.To = addressesOf(headers["to"])
 		default:
 			outgoing.To = from
 		}
