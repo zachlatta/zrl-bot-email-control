@@ -56,6 +56,9 @@ base64 or by reference to an attachment already in the mailbox (`from_message_id
 - Every `date` and `last_date` is when Gmail received or sent the message, as an RFC 5322 date
   in America/New_York. Raw `Date` headers keep each sender's offset, so a thread read out of
   order; the raw header is still in `headers` with `include_headers`.
+- `text` is optional when `html` is given. The plain-text part is then made from the HTML:
+  links keep their URLs, list items become `- ` lines, and table cells are joined with ` | `.
+  Message `text` in read results uses LF line endings.
 - Send, reply, forward and `send_draft` results list the `to`, `cc`, `bcc` and `subject` read
   from the delivered bytes, so there is no need to fetch the sent message to check them.
 - `reply_to_message` with `archive_thread` archives the thread after the reply is sent and sets

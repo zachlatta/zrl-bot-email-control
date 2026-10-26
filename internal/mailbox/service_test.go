@@ -1,13 +1,17 @@
 package mailbox
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"mime/quotedprintable"
+	"net/mail"
 	"slices"
 	"strings"
 	"testing"
@@ -948,5 +952,145 @@ func TestBlockedReplyDoesNotArchive(t *testing.T) {
 				t.Errorf("blocked reply archived the thread: %v", message.LabelIDs)
 			}
 		})
+	}
+}
+
+// plainTextPart returns the decoded text/plain body of a composed message.
+func plainTextPart(t *testing.T, raw []byte) string {
+	t.Helper()
+	message, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var find func(contentType string, body io.Reader) (string, bool)
+	find = func(contentType string, body io.Reader) (string, bool) {
+		mediaType, params, err := mime.ParseMediaType(contentType)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(mediaType, "multipart/") {
+			if mediaType != "text/plain" {
+				return "", false
+			}
+			data, err := io.ReadAll(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(data), true
+		}
+		reader := multipart.NewReader(body, params["boundary"])
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				return "", false
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if text, ok := find(part.Header.Get("Content-Type"), part); ok {
+				return text, true
+			}
+		}
+	}
+	text, ok := find(message.Header.Get("Content-Type"), message.Body)
+	if !ok {
+		t.Fatalf("no text/plain part:\n%s", raw)
+	}
+	return strings.ReplaceAll(text, "\r\n", "\n")
+}
+
+const htmlOnlyBody = `<div style="font-family:system-ui"><p>Your feed is <b>live</b>.</p>` +
+	`<p><a href="https://example.com/feed.xml" style="color:#fff">Open the feed</a></p>` +
+	`<ul><li>Odd Lots</li><li>Acquired</li></ul>` +
+	`<table><tr><th>Show</th><th>Episodes</th></tr><tr><td>Odd Lots</td><td>5</td></tr></table>` +
+	`<p>Nothing needed from you.</p></div>`
+
+// Agents write every reply in HTML. When they leave out text, the plain-text
+// alternative is derived from the HTML instead of going out empty.
+func TestHTMLOnlyMessagesGetPlainText(t *testing.T) {
+	want := []string{
+		"Your feed is live.",
+		"Open the feed (https://example.com/feed.xml)",
+		"- Odd Lots\n- Acquired",
+		"Show | Episodes\nOdd Lots | 5",
+		"Nothing needed from you.",
+	}
+	for name, send := range map[string]func(*Service, *gmailfake.Server) error{
+		"send": func(service *Service, _ *gmailfake.Server) error {
+			_, err := service.Send(t.Context(), Outgoing{To: []string{"zach@hackclub.com"}, Subject: "Feed", HTML: htmlOnlyBody})
+			return err
+		},
+		"reply": func(service *Service, fake *gmailfake.Server) error {
+			id := fake.AddMessage(inboundFromZach, "INBOX")
+			_, err := service.Reply(t.Context(), ReplyInput{MessageID: id, HTML: htmlOnlyBody})
+			return err
+		},
+		"reply without quote": func(service *Service, fake *gmailfake.Server) error {
+			id := fake.AddMessage(inboundFromZach, "INBOX")
+			_, err := service.Reply(t.Context(), ReplyInput{MessageID: id, HTML: htmlOnlyBody, OmitQuote: true})
+			return err
+		},
+		"forward": func(service *Service, fake *gmailfake.Server) error {
+			id := fake.AddMessage(inboundFromZach, "INBOX")
+			_, err := service.Forward(t.Context(), ForwardInput{MessageID: id, To: []string{"zach@hackclub.com"}, HTML: htmlOnlyBody})
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			service, fake := newService(t)
+			if err := send(service, fake); err != nil {
+				t.Fatal(err)
+			}
+			text := plainTextPart(t, fake.Sent()[0])
+			for _, line := range want {
+				if !strings.Contains(text, line) {
+					t.Errorf("text part missing %q:\n%s", line, text)
+				}
+			}
+			if strings.Contains(text, "<p") || strings.Contains(text, "href") {
+				t.Errorf("text part has markup:\n%s", text)
+			}
+			if !strings.HasPrefix(text, "Your feed is live.") {
+				t.Errorf("text part should open with the note:\n%s", text)
+			}
+		})
+	}
+}
+
+func TestHTMLOnlyMessagesStillGated(t *testing.T) {
+	for name, outgoing := range map[string]Outgoing{
+		"to":  {To: []string{"someone@example.com"}},
+		"cc":  {To: []string{"zach@hackclub.com"}, Cc: []string{"someone@example.com"}},
+		"bcc": {To: []string{"zach@hackclub.com"}, Bcc: []string{"someone@example.com"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			service, fake := newService(t)
+			outgoing.Subject, outgoing.HTML = "Feed", htmlOnlyBody
+			_, err := service.Send(t.Context(), outgoing)
+			assertBlocked(t, fake, err)
+		})
+	}
+}
+
+func TestExplicitTextIsKept(t *testing.T) {
+	service, fake := newService(t)
+	if _, err := service.Send(t.Context(), Outgoing{To: []string{"zach@hackclub.com"}, Subject: "Feed", Text: "Short version.", HTML: htmlOnlyBody}); err != nil {
+		t.Fatal(err)
+	}
+	if text := plainTextPart(t, fake.Sent()[0]); text != "Short version." {
+		t.Fatalf("text part = %q", text)
+	}
+}
+
+// Gmail stores text bodies with CRLF line endings; agents get plain LF.
+func TestMessageTextUsesLF(t *testing.T) {
+	service, fake := newService(t)
+	id := fake.AddMessage("From: zach@hackclub.com\nTo: zrl-bot@hackclub.com\nSubject: Lines\nContent-Type: text/plain; charset=utf-8\n\nFirst line.\n\nSecond line.\n", "INBOX")
+	message, err := service.GetMessage(t.Context(), id, GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(message.Text, "\r") || !strings.Contains(message.Text, "First line.\n\nSecond line.") {
+		t.Fatalf("text = %q", message.Text)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html"
 	"net/mail"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -36,8 +37,8 @@ type Outgoing struct {
 	Bcc         []string          `json:"bcc,omitempty"`
 	ReplyTo     []string          `json:"reply_to,omitempty" jsonschema:"Optional Reply-To addresses (allowlisted). Replies, including reply_to_message on this message, go here."`
 	Subject     string            `json:"subject,omitempty"`
-	Text        string            `json:"text,omitempty" jsonschema:"Plain-text body."`
-	HTML        string            `json:"html,omitempty" jsonschema:"Optional HTML body (sent alongside the text body)."`
+	Text        string            `json:"text,omitempty" jsonschema:"Plain-text body. With html, optional: when omitted it is made from the HTML (links keep their URLs)."`
+	HTML        string            `json:"html,omitempty" jsonschema:"HTML body. Sent with a plain-text alternative: text, or text made from this HTML."`
 	Attachments []AttachmentInput `json:"attachments,omitempty"`
 	ThreadID    string            `json:"thread_id,omitempty" jsonschema:"Optional Gmail thread ID to file the message into."`
 
@@ -105,7 +106,7 @@ func (s *Service) compose(ctx context.Context, service *gmail.Service, outgoing 
 	}
 	return mimemsg.Compose(mimemsg.Message{
 		From: s.cfg.Address, To: outgoing.To, Cc: outgoing.Cc, Bcc: outgoing.Bcc, ReplyTo: outgoing.ReplyTo,
-		Subject: outgoing.Subject, Text: outgoing.Text, HTML: outgoing.HTML,
+		Subject: outgoing.Subject, Text: plainBody(outgoing.Text, outgoing.HTML), HTML: outgoing.HTML,
 		Attachments: attachments, InReplyTo: outgoing.inReplyTo, References: outgoing.references,
 	})
 }
@@ -206,8 +207,8 @@ type ReplyInput struct {
 	To              []string          `json:"to,omitempty" jsonschema:"Override the recipients instead of deriving them from the original."`
 	Cc              []string          `json:"cc,omitempty"`
 	Bcc             []string          `json:"bcc,omitempty"`
-	Text            string            `json:"text,omitempty" jsonschema:"Plain-text body."`
-	HTML            string            `json:"html,omitempty" jsonschema:"Optional HTML body (sent alongside the text body)."`
+	Text            string            `json:"text,omitempty" jsonschema:"Plain-text body. With html, optional: when omitted it is made from the HTML (links keep their URLs)."`
+	HTML            string            `json:"html,omitempty" jsonschema:"HTML body. Sent with a plain-text alternative: text, or text made from this HTML."`
 	Attachments     []AttachmentInput `json:"attachments,omitempty"`
 	OmitQuote       bool              `json:"omit_quote,omitempty" jsonschema:"Do not quote the original message below the reply."`
 	SaveAsDraftOnly bool              `json:"-"`
@@ -280,7 +281,7 @@ func (s *Service) replyOutgoing(ctx context.Context, service *gmail.Service, inp
 	if !input.OmitQuote {
 		body := detail(original, GetOptions{IncludeHTML: true})
 		attribution := replyAttribution(headers["date"], decodeHeader(headers["from"]))
-		outgoing.Text = strings.TrimRight(input.Text, "\n") + "\n\n" + attribution + "\n" + quoteText(body.Text)
+		outgoing.Text = strings.TrimRight(plainBody(input.Text, input.HTML), "\n") + "\n\n" + attribution + "\n" + quoteText(body.Text)
 		note := input.HTML
 		if note == "" {
 			note = textToHTML(input.Text)
@@ -301,7 +302,7 @@ type ForwardInput struct {
 	Cc                 []string          `json:"cc,omitempty"`
 	Bcc                []string          `json:"bcc,omitempty"`
 	Text               string            `json:"text,omitempty" jsonschema:"Optional note above the forwarded message."`
-	HTML               string            `json:"html,omitempty"`
+	HTML               string            `json:"html,omitempty" jsonschema:"Optional HTML note; the text note is made from it when text is omitted."`
 	ExcludeAttachments bool              `json:"exclude_attachments,omitempty" jsonschema:"Do not include the original attachments."`
 	Attachments        []AttachmentInput `json:"attachments,omitempty" jsonschema:"Extra attachments to add."`
 }
@@ -333,7 +334,7 @@ func (s *Service) Forward(ctx context.Context, input ForwardInput) (SendResult, 
 		}
 	}
 	outgoing := Outgoing{To: input.To, Cc: input.Cc, Bcc: input.Bcc, Subject: subject}
-	outgoing.Text = strings.TrimSpace(input.Text+"\n\n") + "\n\n" + meta.String() + "\n" + body.Text
+	outgoing.Text = strings.TrimSpace(plainBody(input.Text, input.HTML)+"\n\n") + "\n\n" + meta.String() + "\n" + body.Text
 	if input.HTML != "" || body.HTML != "" {
 		note := input.HTML
 		if note == "" {
@@ -579,6 +580,37 @@ func textToHTML(text string) string {
 		out.WriteString("<div>" + strings.ReplaceAll(html.EscapeString(paragraph), "\n", "<br>") + "</div><div><br></div>")
 	}
 	return strings.TrimSuffix(out.String(), "<div><br></div>")
+}
+
+var (
+	htmlLink       = regexp.MustCompile(`(?is)<a\s[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>(.*?)</a\s*>`)
+	htmlListItem   = regexp.MustCompile(`(?i)<li(\s[^>]*)?>`)
+	htmlCellJoin   = regexp.MustCompile(`(?i)</t[dh]\s*>\s*(<t[dh](\s[^>]*)?>)`)
+	htmlBlockEnd   = regexp.MustCompile(`(?i)</(p|h[1-6]|ul|ol|table)\s*>`)
+	htmlListOpener = regexp.MustCompile(`(?i)<(ul|ol)(\s[^>]*)?>`)
+)
+
+// plainBody is the text/plain body of an outgoing message: the agent's text,
+// or, when it wrote only HTML, that HTML as readable text. Links keep their
+// URL, list items become "- " lines and table cells are joined with " | ".
+func plainBody(text, htmlBody string) string {
+	if text != "" || htmlBody == "" {
+		return text
+	}
+	value := htmlLink.ReplaceAllStringFunc(htmlBody, func(link string) string {
+		match := htmlLink.FindStringSubmatch(link)
+		href, label := html.UnescapeString(match[1]), match[2]
+		shown := strings.TrimSpace(htmlToText(label))
+		if href == "" || strings.HasPrefix(strings.ToLower(href), "cid:") || shown == href || strings.TrimPrefix(href, "mailto:") == shown {
+			return label
+		}
+		return label + " (" + match[1] + ")"
+	})
+	value = htmlListOpener.ReplaceAllString(value, "\n")
+	value = htmlListItem.ReplaceAllString(value, "- ")
+	value = htmlCellJoin.ReplaceAllString(value, " | $1")
+	value = htmlBlockEnd.ReplaceAllString(value, "\n\n")
+	return htmlToText(value)
 }
 
 // htmlBodyContent returns what is inside <body>, so a quoted message does not

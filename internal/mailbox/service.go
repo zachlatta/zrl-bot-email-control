@@ -895,7 +895,7 @@ func detail(message *gmail.Message, options GetOptions) MessageDetail {
 		switch p.MimeType {
 		case "text/plain":
 			if text == "" {
-				text = decodePartText(p)
+				text = strings.ReplaceAll(decodePartText(p), "\r\n", "\n")
 			}
 		case "text/html":
 			if htmlBody == "" {
